@@ -14,7 +14,7 @@ KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifat
 - faqat indeksdan yoki kanal va indeksdan o‘chirish;
 - ixtiyoriy telefon ulash, JSON metadata eksporti va foydalanuvchi metadata hisobini o‘chirish;
 - metadata-only responsive admin panel, bloklash/ochish, kanal uzish va audit jurnali;
-- webhook path va Telegram secret header tekshiruvi, HttpOnly admin sessiyasi, CSRF, login rate-limit va xavfsizlik headerlari;
+- Telegram secret header bilan himoyalangan webhook, HttpOnly admin sessiyasi, CSRF, login rate-limit va xavfsizlik headerlari;
 - GitHub commitidan Render auto-deploy va avtomatik Telegram webhook sozlash.
 
 ## Ixcham tuzilma
@@ -43,7 +43,7 @@ Storage kanalni ulashda botga kamida **Post Messages** huquqi kerak. “Kanal + 
 ## 2. Supabase tayyorlash
 
 1. Supabase’da yangi project yarating.
-2. SQL Editor’ni ochib, [schema.sql](schema.sql) ichidagi SQL’ni to‘liq ishga tushiring.
+2. KeepGram birinchi ishga tushishda [schema.sql](schema.sql) sxemasini avtomatik yaratadi. Agar hosting DB roli DDL yaratishga ruxsat bermasa, SQL Editor’da fayl ichidagi SQL’ni qo‘lda to‘liq ishga tushiring.
 3. Project Settings → Database → Connection string → URI’dan server ulanish satrini oling.
 4. Render uchun Transaction pooler (odatda `:6543`) URI qulay. `[YOUR-PASSWORD]` qismini haqiqiy DB paroliga almashtiring. Paroldagi maxsus belgilar URL-encode qilinishi kerak.
 
@@ -100,7 +100,7 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 
 `WEBHOOK_SECRET` va `SESSION_SECRET` Blueprint tomonidan avtomatik yaratiladi. Agar servisni Blueprint’siz qo‘lda yaratsangiz, ularni ham o‘zingiz kiriting.
 
-5. Deploy tugagach `https://SIZNING-SERVIS.onrender.com/health` manzilida `status: ok` ko‘rinishi kerak.
+5. Deploy tugagach `https://SIZNING-SERVIS.onrender.com/health` manzilida `status: ok`, `database: true` va `schema: true` ko‘rinishi kerak.
 6. Botga `/start` yuboring. Webhook ilova ishga tushganida avtomatik o‘rnatiladi.
 7. Admin panel: `https://SIZNING-SERVIS.onrender.com/admin`.
 

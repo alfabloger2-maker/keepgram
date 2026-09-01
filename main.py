@@ -256,6 +256,39 @@ class Database:
         except (asyncpg.PostgresError, OSError, RuntimeError):
             return False
 
+    async def schema_ready(self) -> bool:
+        """Check that every table required by the bot and admin panel exists."""
+        try:
+            return bool(
+                await self.ready().fetchval(
+                    """
+                    SELECT to_regclass('public.users') IS NOT NULL
+                       AND to_regclass('public.storage_channels') IS NOT NULL
+                       AND to_regclass('public.user_settings') IS NOT NULL
+                       AND to_regclass('public.catalogs') IS NOT NULL
+                       AND to_regclass('public.files') IS NOT NULL
+                       AND to_regclass('public.channel_link_tokens') IS NOT NULL
+                       AND to_regclass('public.audit_logs') IS NOT NULL
+                    """
+                )
+            )
+        except (asyncpg.PostgresError, OSError, RuntimeError):
+            return False
+
+    async def ensure_schema(self) -> bool:
+        """Install the idempotent Supabase schema on a fresh database."""
+        if await self.schema_ready():
+            return False
+        schema_path = BASE_DIR / "schema.sql"
+        if not schema_path.is_file():
+            raise RuntimeError("schema.sql topilmadi")
+        schema_sql = schema_path.read_text(encoding="utf-8")
+        async with self.ready().acquire() as conn, conn.transaction():
+            await conn.execute(schema_sql)
+        if not await self.schema_ready():
+            raise RuntimeError("KeepGram database sxemasi to‘liq yaratilmadi")
+        return True
+
     async def upsert_user(self, tg_user: Any) -> asyncpg.Record:
         return await self.ready().fetchrow(
             """
@@ -1931,6 +1964,8 @@ async def admin_log(
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await db.connect()
+    if await db.ensure_schema():
+        log.info("Fresh database detected; KeepGram schema installed automatically")
     await bot.set_my_commands(
         [
             BotCommand(command="start", description="KeepGram’ni boshlash"),
@@ -1947,7 +1982,7 @@ async def lifespan(_: FastAPI):
         ]
     )
     webhook_secret = settings.webhook_secret.get_secret_value()
-    webhook_url = f"{settings.app_base_url}/telegram/webhook/{webhook_secret}"
+    webhook_url = f"{settings.app_base_url}/telegram/webhook"
     await bot.set_webhook(
         webhook_url,
         secret_token=webhook_secret,
@@ -2004,25 +2039,26 @@ async def root() -> str:
 @app.get("/health")
 @app.get("/ping")
 async def health() -> JSONResponse:
-    ok = await db.ping()
+    connected = await db.ping()
+    schema = connected and await db.schema_ready()
+    ok = connected and schema
     return JSONResponse(
         {
             "status": "ok" if ok else "degraded",
             "app": APP_NAME,
             "version": APP_VERSION,
-            "database": ok,
+            "database": connected,
+            "schema": schema,
         },
         status_code=200 if ok else 503,
     )
 
 
-@app.post("/telegram/webhook/{path_secret}", include_in_schema=False)
-async def telegram_webhook(path_secret: str, request: Request) -> Response:
+@app.post("/telegram/webhook", include_in_schema=False)
+async def telegram_webhook(request: Request) -> Response:
     expected = settings.webhook_secret.get_secret_value()
     header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not hmac.compare_digest(path_secret, expected) or not hmac.compare_digest(
-        header, expected
-    ):
+    if not hmac.compare_digest(header, expected):
         raise HTTPException(status_code=403, detail="Forbidden")
     try:
         update = Update.model_validate(await request.json(), context={"bot": bot})

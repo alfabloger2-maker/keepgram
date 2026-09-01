@@ -45,7 +45,7 @@ class KeepGramCoreTests(unittest.TestCase):
     def test_public_routes_exist(self):
         paths = {route.path for route in main.app.routes}
         self.assertIn("/health", paths)
-        self.assertIn("/telegram/webhook/{path_secret}", paths)
+        self.assertIn("/telegram/webhook", paths)
         self.assertIn("/admin", paths)
 
 
