@@ -100,6 +100,28 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("admin_username")
+    @classmethod
+    def normalize_admin_username(cls, value: str) -> str:
+        value = value.strip()
+        if not 3 <= len(value) <= 64:
+            raise ValueError("ADMIN_USERNAME 3-64 belgi bo‘lishi kerak")
+        return value
+
+    @field_validator("admin_password_hash")
+    @classmethod
+    def validate_admin_password_hash(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value().strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+            raw = raw[1:-1].strip()
+        try:
+            bcrypt.checkpw(b"keepgram-hash-validation", raw.encode("utf-8"))
+        except ValueError as exc:
+            raise ValueError(
+                "ADMIN_PASSWORD_HASH yaroqli bcrypt hash emas; oddiy parolni bu yerga yozmang"
+            ) from exc
+        return SecretStr(raw)
+
     @field_validator("session_secret")
     @classmethod
     def validate_session_secret(cls, value: SecretStr) -> SecretStr:
@@ -276,9 +298,8 @@ class Database:
             return False
 
     async def ensure_schema(self) -> bool:
-        """Install the idempotent Supabase schema on a fresh database."""
-        if await self.schema_ready():
-            return False
+        """Install or migrate the idempotent Supabase schema."""
+        was_ready = await self.schema_ready()
         schema_path = BASE_DIR / "schema.sql"
         if not schema_path.is_file():
             raise RuntimeError("schema.sql topilmadi")
@@ -287,7 +308,7 @@ class Database:
             await conn.execute(schema_sql)
         if not await self.schema_ready():
             raise RuntimeError("KeepGram database sxemasi to‘liq yaratilmadi")
-        return True
+        return not was_ready
 
     async def upsert_user(self, tg_user: Any) -> asyncpg.Record:
         return await self.ready().fetchrow(
@@ -315,6 +336,27 @@ class Database:
     async def update_phone(self, telegram_id: int, phone: str) -> None:
         await self.ready().execute(
             "UPDATE users SET phone=$2,last_seen_at=now() WHERE telegram_id=$1",
+            telegram_id,
+            phone[:32],
+        )
+
+    async def update_onboarding_name(
+        self, telegram_id: int, display_name: str
+    ) -> asyncpg.Record | None:
+        return await self.ready().fetchrow(
+            """UPDATE users SET display_name=$2,last_seen_at=now()
+               WHERE telegram_id=$1 RETURNING *""",
+            telegram_id,
+            display_name[:80],
+        )
+
+    async def complete_onboarding(
+        self, telegram_id: int, phone: str
+    ) -> asyncpg.Record | None:
+        return await self.ready().fetchrow(
+            """UPDATE users SET phone=$2,onboarding_completed=true,
+                      onboarded_at=COALESCE(onboarded_at,now()),last_seen_at=now()
+               WHERE telegram_id=$1 AND display_name IS NOT NULL RETURNING *""",
             telegram_id,
             phone[:32],
         )
@@ -716,6 +758,7 @@ dp.include_router(router)
 
 
 class Flow(StatesGroup):
+    onboarding_name = State()
     search = State()
     rename = State()
     tags = State()
@@ -779,6 +822,15 @@ MAIN_MENU = ReplyKeyboardMarkup(
     input_field_placeholder="Fayl, kod yoki qidiruv matnini yuboring",
 )
 
+ONBOARDING_PHONE_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📱 Telefon raqamimni yuborish", request_contact=True)]
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+    input_field_placeholder="Telefon raqamingizni Telegram orqali yuboring",
+)
+
 
 def ikb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -832,7 +884,9 @@ def file_card(row: asyncpg.Record) -> str:
     )
 
 
-async def actor_user(event: Message | CallbackQuery) -> asyncpg.Record | None:
+async def actor_user(
+    event: Message | CallbackQuery, *, allow_incomplete: bool = False
+) -> asyncpg.Record | None:
     tg_user = event.from_user
     if not tg_user:
         return None
@@ -843,6 +897,21 @@ async def actor_user(event: Message | CallbackQuery) -> asyncpg.Record | None:
         else:
             await event.answer(
                 "🚫 Hisobingiz vaqtincha bloklangan. Administrator bilan bog‘laning."
+            )
+        return None
+    if not user["onboarding_completed"] and not allow_incomplete:
+        target = event.message if isinstance(event, CallbackQuery) else event
+        if isinstance(event, CallbackQuery):
+            await event.answer("Avval ro‘yxatdan o‘tishni yakunlang.", show_alert=True)
+        if user["display_name"]:
+            await target.answer(
+                "📱 KeepGram’dan foydalanish uchun telefon raqamingizni pastdagi tugma orqali yuboring.",
+                reply_markup=ONBOARDING_PHONE_KEYBOARD,
+            )
+        else:
+            await target.answer(
+                "👤 Ro‘yxatdan o‘tishni boshlash uchun /start yuboring.",
+                reply_markup=ReplyKeyboardRemove(),
             )
         return None
     return user
@@ -965,7 +1034,24 @@ async def save_message(message: Message) -> None:
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if not await actor_user(message):
+    user = await actor_user(message, allow_incomplete=True)
+    if not user:
+        return
+    if not user["onboarding_completed"]:
+        if not user["display_name"]:
+            await state.set_state(Flow.onboarding_name)
+            await message.answer(
+                "👋 <b>KeepGram’ga xush kelibsiz!</b>\n\n"
+                "Ro‘yxatdan o‘tish uchun ismingiz va Telegram orqali tasdiqlangan telefon raqamingiz kerak. "
+                "Bu ma’lumotlar hisobingizni aniqlash va xavfsiz boshqarish uchun saqlanadi.\n\n"
+                "👤 <b>Ismingizni yozib yuboring:</b>",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            await message.answer(
+                f"Salom, <b>{esc(user['display_name'])}</b>! Endi telefon raqamingizni tasdiqlang.",
+                reply_markup=ONBOARDING_PHONE_KEYBOARD,
+            )
         return
     storage = await db.storage_by_tg(message.from_user.id)
     text = (
@@ -985,10 +1071,43 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await message.answer("Asosiy menyu:", reply_markup=MAIN_MENU)
 
 
+@router.message(
+    Flow.onboarding_name,
+    F.text,
+    ~F.text.startswith("/"),
+    F.chat.type == ChatType.PRIVATE,
+)
+async def onboarding_name(message: Message, state: FSMContext) -> None:
+    if not await actor_user(message, allow_incomplete=True):
+        return
+    name = re.sub(r"[\x00-\x1f]", "", message.text).strip()
+    name = re.sub(r"\s+", " ", name)
+    if not 2 <= len(name) <= 80 or not any(char.isalpha() for char in name):
+        await message.answer(
+            "Ism 2–80 belgidan iborat bo‘lsin va kamida bitta harf qatnashsin. Qayta kiriting:"
+        )
+        return
+    user = await db.update_onboarding_name(message.from_user.id, name)
+    if not user:
+        await message.answer(
+            "Ro‘yxatdan o‘tishda xatolik. /start orqali qayta urinib ko‘ring."
+        )
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Rahmat, <b>{esc(name)}</b>.\n\n"
+        "📱 Endi pastdagi tugmani bosib o‘zingizning Telegram telefon raqamingizni yuboring. "
+        "Boshqa kontakt yoki qo‘lda yozilgan raqam qabul qilinmaydi.",
+        reply_markup=ONBOARDING_PHONE_KEYBOARD,
+    )
+
+
 @router.message(Command("menu"), F.chat.type == ChatType.PRIVATE)
 async def cmd_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await actor_user(message)
+    if not await actor_user(message):
+        return
     await message.answer("KeepGram asosiy menyusi:", reply_markup=MAIN_MENU)
 
 
@@ -1015,7 +1134,7 @@ async def cmd_privacy(message: Message) -> None:
     await message.answer(
         "🔐 <b>Maxfiylik</b>\n\nFayllar KeepGram serverida saqlanmaydi; ular siz ulagan Telegram kanalida qoladi. "
         "Bazaga faqat nom, kod, katalog, teg, kanal ID va xabar ID kabi indeks metadata yoziladi. "
-        "Telefon raqamingiz faqat o‘zingiz kontakt tugmasi orqali ulashsangiz saqlanadi. "
+        "Ism va telefon raqami ro‘yxatdan o‘tish uchun majburiy; telefon faqat o‘zingiz Telegram kontakt tugmasi orqali tasdiqlaganingizda saqlanadi. "
         "Admin panel real faylni ko‘rsatmaydi. Kanal va Telegram hisobingiz xavfsizligi sizning nazoratingizda."
     )
 
@@ -1273,16 +1392,45 @@ async def save_media(message: Message, state: FSMContext) -> None:
 
 @router.message(F.contact, F.chat.type == ChatType.PRIVATE)
 async def save_contact_or_phone(message: Message, state: FSMContext) -> None:
-    if not await actor_user(message):
+    user = await actor_user(message, allow_incomplete=True)
+    if not user:
         return
     if message.contact and message.contact.user_id == message.from_user.id:
+        if not user["display_name"]:
+            await state.set_state(Flow.onboarding_name)
+            await message.answer(
+                "Avval ismingizni yozib yuboring:", reply_markup=ReplyKeyboardRemove()
+            )
+            return
+        if not user["onboarding_completed"]:
+            completed = await db.complete_onboarding(
+                message.from_user.id, message.contact.phone_number
+            )
+            if not completed:
+                await message.answer(
+                    "Ro‘yxatdan o‘tishni yakunlab bo‘lmadi. /start orqali qayta urinib ko‘ring."
+                )
+                return
+            await state.clear()
+            await message.answer(
+                "✅ <b>Ro‘yxatdan o‘tish yakunlandi!</b>\n\nEndi KeepGram’dan foydalanishingiz mumkin.",
+                reply_markup=MAIN_MENU,
+            )
+            await cmd_start(message, state)
+            return
         await db.update_phone(message.from_user.id, message.contact.phone_number)
         await state.clear()
         await message.answer(
-            "✅ Telefon raqamingiz ixtiyoriy metadata sifatida saqlandi.",
+            "✅ Telefon raqamingiz yangilandi.",
             reply_markup=MAIN_MENU,
         )
     else:
+        if not user["onboarding_completed"]:
+            await message.answer(
+                "⚠️ Faqat o‘zingizning telefon raqamingizni pastdagi maxsus tugma orqali yuboring.",
+                reply_markup=ONBOARDING_PHONE_KEYBOARD,
+            )
+            return
         await state.clear()
         await save_message(message)
 
@@ -1782,7 +1930,8 @@ async def settings_phone(callback: CallbackQuery) -> None:
         one_time_keyboard=True,
     )
     await callback.message.answer(
-        "Telefon ixtiyoriy. Faqat o‘zingiz xohlasangiz ulashing:", reply_markup=keyboard
+        "Hisobga ulangan telefon raqamini yangilash uchun o‘zingizning kontaktingizni yuboring:",
+        reply_markup=keyboard,
     )
 
 
@@ -1904,6 +2053,23 @@ async def delete_my_data_finish(message: Message, state: FSMContext) -> None:
 @router.message(Command("bekor"), F.chat.type == ChatType.PRIVATE)
 @router.message(F.text == "❌ Bekor", F.chat.type == ChatType.PRIVATE)
 async def cancel(message: Message, state: FSMContext) -> None:
+    user = await actor_user(message, allow_incomplete=True)
+    if not user:
+        return
+    if not user["onboarding_completed"]:
+        if not user["display_name"]:
+            await state.set_state(Flow.onboarding_name)
+            await message.answer(
+                "Ro‘yxatdan o‘tish majburiy. Davom etish uchun ismingizni yozing:",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        else:
+            await state.clear()
+            await message.answer(
+                "Ro‘yxatdan o‘tish majburiy. Telefon raqamingizni tasdiqlang:",
+                reply_markup=ONBOARDING_PHONE_KEYBOARD,
+            )
+        return
     await state.clear()
     await message.answer("Amal bekor qilindi.", reply_markup=MAIN_MENU)
 
@@ -1931,9 +2097,24 @@ class LoginBody(BaseModel):
 login_attempts: dict[str, list[float]] = {}
 
 
+def session_fingerprint(request: Request) -> str:
+    user_agent = request.headers.get("user-agent", "")[:512]
+    return hmac.new(
+        settings.session_secret.get_secret_value().encode("utf-8"),
+        user_agent.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def session_admin(request: Request) -> str:
     username = request.session.get("admin")
-    if not username:
+    fingerprint = str(request.session.get("fingerprint", ""))
+    if (
+        not username
+        or not fingerprint
+        or not hmac.compare_digest(fingerprint, session_fingerprint(request))
+    ):
+        request.session.clear()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Kirish talab qilinadi"
         )
@@ -2081,6 +2262,15 @@ async def admin_page() -> FileResponse:
     return FileResponse(BASE_DIR / "admin.html", media_type="text/html")
 
 
+@app.api_route(
+    "/admin/{unexpected_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+async def reject_unknown_admin_path(unexpected_path: str) -> None:
+    raise HTTPException(status_code=404, detail="Sahifa topilmadi")
+
+
 @app.post("/api/admin/login")
 async def admin_login(body: LoginBody, request: Request) -> dict[str, Any]:
     ip = request.client.host if request.client else "unknown"
@@ -2088,7 +2278,8 @@ async def admin_login(body: LoginBody, request: Request) -> dict[str, Any]:
     attempts = [value for value in login_attempts.get(ip, []) if now - value < 600]
     if len(attempts) >= 5:
         raise HTTPException(429, "10 daqiqada juda ko‘p noto‘g‘ri urinish")
-    username_ok = hmac.compare_digest(body.username, settings.admin_username)
+    submitted_username = body.username.strip()
+    username_ok = hmac.compare_digest(submitted_username, settings.admin_username)
     try:
         password_ok = bcrypt.checkpw(
             body.password.encode(),
@@ -2102,7 +2293,7 @@ async def admin_login(body: LoginBody, request: Request) -> dict[str, Any]:
         login_attempts[ip] = attempts
         await db.audit(
             "admin",
-            body.username[:100],
+            submitted_username[:100],
             "login_failed",
             metadata={"ip_hash": hashlib.sha256(ip.encode()).hexdigest()[:16]},
         )
@@ -2111,6 +2302,8 @@ async def admin_login(body: LoginBody, request: Request) -> dict[str, Any]:
     request.session.clear()
     request.session["admin"] = settings.admin_username
     request.session["csrf"] = secrets.token_urlsafe(24)
+    request.session["fingerprint"] = session_fingerprint(request)
+    request.session["issued_at"] = int(time.time())
     await admin_log(settings.admin_username, "login")
     return {
         "ok": True,
@@ -2126,6 +2319,21 @@ async def admin_logout(
     await admin_log(admin, "logout")
     request.session.clear()
     return {"ok": True}
+
+
+@app.get("/api/admin/session")
+async def admin_session(request: Request) -> dict[str, Any]:
+    try:
+        admin = session_admin(request)
+    except HTTPException:
+        return {"authenticated": False}
+    csrf = request.session.get("csrf") or secrets.token_urlsafe(24)
+    request.session["csrf"] = csrf
+    return {
+        "authenticated": True,
+        "username": admin,
+        "csrf": csrf,
+    }
 
 
 @app.get("/api/admin/me")
@@ -2147,7 +2355,8 @@ async def admin_stats(_: str = Depends(session_admin)) -> dict[str, Any]:
                   (SELECT count(*) FROM users WHERE is_blocked)::int blocked"""
     )
     recent_users = await db.ready().fetch(
-        "SELECT telegram_id,username,first_name,created_at FROM users ORDER BY created_at DESC LIMIT 7"
+        """SELECT telegram_id,username,COALESCE(display_name,first_name) AS first_name,
+                  created_at FROM users ORDER BY created_at DESC LIMIT 7"""
     )
     recent_files = await db.ready().fetch(
         "SELECT title,code,file_type,created_at FROM files WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 7"
@@ -2167,13 +2376,15 @@ async def admin_users(
     _: str = Depends(session_admin),
 ) -> dict[str, Any]:
     where = """$1='' OR u.telegram_id::text ILIKE '%'||$1||'%' OR COALESCE(u.username,'') ILIKE '%'||$1||'%'
+               OR COALESCE(u.display_name,'') ILIKE '%'||$1||'%'
                OR COALESCE(u.first_name,'') ILIKE '%'||$1||'%' OR COALESCE(u.last_name,'') ILIKE '%'||$1||'%'
                OR COALESCE(u.phone,'') ILIKE '%'||$1||'%'"""
     total = await db.ready().fetchval(
         f"SELECT count(*) FROM users u WHERE {where}", search
     )
     rows = await db.ready().fetch(
-        f"""SELECT u.id,u.telegram_id,u.username,u.first_name,u.last_name,u.phone,u.is_blocked,
+        f"""SELECT u.id,u.telegram_id,u.username,COALESCE(u.display_name,u.first_name) AS first_name,
+                   u.last_name,u.phone,u.onboarding_completed,u.is_blocked,
                    u.created_at,u.last_seen_at,s.channel_title,s.telegram_channel_id,
                    count(f.id) FILTER(WHERE f.deleted_at IS NULL)::int file_count
             FROM users u LEFT JOIN storage_channels s ON s.user_id=u.id
@@ -2205,7 +2416,11 @@ async def admin_user_detail(
            FROM files WHERE user_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100""",
         user_id,
     )
-    return {"user": jsonable(user), "files": jsonable(files)}
+    user_payload = jsonable(user)
+    user_payload["first_name"] = user_payload.get("display_name") or user_payload.get(
+        "first_name"
+    )
+    return {"user": user_payload, "files": jsonable(files)}
 
 
 @app.post("/api/admin/users/{user_id}/block")
