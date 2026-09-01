@@ -47,7 +47,8 @@ from redis.asyncio import Redis
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_NAME = "KeepGram"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
+TERMS_VERSION = "1.0"
 BASE_DIR = Path(__file__).resolve().parent
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_RE = re.compile(r"^[A-HJ-NP-Z2-9]{6}$", re.IGNORECASE)
@@ -613,15 +614,27 @@ class Database:
             display_name[:80],
         )
 
-    async def complete_onboarding(
+    async def save_onboarding_phone(
         self, telegram_id: int, phone: str
     ) -> asyncpg.Record | None:
         return await self.ready().fetchrow(
-            """UPDATE users SET phone=$2,onboarding_completed=true,
-                      onboarded_at=COALESCE(onboarded_at,now()),last_seen_at=now()
+            """UPDATE users SET phone=$2,last_seen_at=now()
                WHERE telegram_id=$1 AND display_name IS NOT NULL RETURNING *""",
             telegram_id,
             phone[:32],
+        )
+
+    async def accept_terms(
+        self, telegram_id: int, terms_version: str
+    ) -> asyncpg.Record | None:
+        return await self.ready().fetchrow(
+            """UPDATE users SET terms_accepted_at=now(),terms_version=$2,
+                      onboarding_completed=true,
+                      onboarded_at=COALESCE(onboarded_at,now()),last_seen_at=now()
+               WHERE telegram_id=$1 AND display_name IS NOT NULL AND phone IS NOT NULL
+               RETURNING *""",
+            telegram_id,
+            terms_version,
         )
 
     async def storage_by_tg(self, telegram_id: int) -> asyncpg.Record | None:
@@ -1458,11 +1471,9 @@ class Database:
             telegram_id,
         )
 
-    async def enqueue_existing_owner_backups(
-        self, telegram_ids: list[int], target_channel_id: int
+    async def enqueue_existing_consented_backups(
+        self, terms_version: str, target_channel_id: int
     ) -> int:
-        if not telegram_ids:
-            return 0
         rows = await self.ready().fetch(
             """INSERT INTO backup_assets(
                    file_id,owner_telegram_id,owner_name,owner_username,
@@ -1477,7 +1488,9 @@ class Database:
                                 FROM file_parts fp WHERE fp.file_id=f.id),ARRAY[f.channel_message_id])
                FROM files f JOIN users u ON u.id=f.user_id
                JOIN storage_channels s ON s.id=f.channel_id
-               WHERE u.telegram_id=ANY($1::bigint[]) AND f.deleted_at IS NULL
+               WHERE u.onboarding_completed AND u.terms_accepted_at IS NOT NULL
+                 AND u.terms_version=$1
+                 AND f.deleted_at IS NULL
                  AND NOT EXISTS(
                    SELECT 1 FROM backup_assets existing WHERE existing.file_id=f.id
                      AND (existing.status IN ('pending','processing') OR
@@ -1485,18 +1498,24 @@ class Database:
                  )
                ON CONFLICT (file_id,version) DO NOTHING
                RETURNING id""",
-            telegram_ids,
+            terms_version,
             target_channel_id,
         )
         return len(rows)
 
-    async def pending_super_backups(self, limit: int = 5) -> list[asyncpg.Record]:
+    async def pending_super_backups(
+        self, terms_version: str, limit: int = 5
+    ) -> list[asyncpg.Record]:
         return list(
             await self.ready().fetch(
                 """SELECT b.*,a.super_backup_channel_id FROM backup_assets b
+                   JOIN users u ON u.telegram_id=b.owner_telegram_id
                    CROSS JOIN app_settings a WHERE a.singleton=true
                      AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
-                     AND b.status='pending' ORDER BY b.created_at LIMIT $1""",
+                     AND u.onboarding_completed AND u.terms_accepted_at IS NOT NULL
+                     AND u.terms_version=$1 AND b.status='pending'
+                   ORDER BY b.created_at LIMIT $2""",
+                terms_version,
                 limit,
             )
         )
@@ -1515,14 +1534,19 @@ class Database:
             telegram_id,
         )
 
-    async def claim_super_backup(self, backup_id: UUID) -> asyncpg.Record | None:
+    async def claim_super_backup(
+        self, backup_id: UUID, terms_version: str
+    ) -> asyncpg.Record | None:
         return await self.ready().fetchrow(
             """UPDATE backup_assets b SET status='processing',updated_at=now()
-               FROM app_settings a
+               FROM app_settings a,users u
                WHERE b.id=$1 AND b.status='pending' AND a.singleton=true
                  AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
+                 AND u.telegram_id=b.owner_telegram_id AND u.onboarding_completed
+                 AND u.terms_accepted_at IS NOT NULL AND u.terms_version=$2
                RETURNING b.*,a.super_backup_channel_id""",
             backup_id,
+            terms_version,
         )
 
     async def requeue_stale_super_backups(self) -> None:
@@ -1790,6 +1814,29 @@ def configured_admin_telegram_ids() -> set[int]:
     }
 
 
+def terms_are_current(user: Any) -> bool:
+    return bool(
+        record_value(user, "terms_accepted_at")
+        and record_value(user, "terms_version") == TERMS_VERSION
+    )
+
+
+async def send_terms(message: Message) -> None:
+    await message.answer(
+        "📜 <b>KeepGram foydalanish shartlari</b>\n\n"
+        "KeepGram’dan foydalanish uchun quyidagilarga rozilik berishingiz kerak:\n\n"
+        "• Ismingiz, tasdiqlangan telefon raqamingiz va fayl indeks metadata bazada saqlanadi.\n"
+        "• Botga yuborgan fayllaringiz o‘zingiz ulagan Telegram kanaliga nusxalanadi.\n"
+        "• Avariya holatida tiklash uchun ushbu fayllar administrator boshqaradigan qo‘shimcha backup kanaliga ham nusxalanadi.\n"
+        "• Backupda egangiz ID’si, fayl nomi, kodi, turi, sana va asl kanal ma’lumotlari saqlanadi.\n"
+        "• Asl fayl yoki indeks o‘chirilsa, tiklash uchun backup nusxasi saqlanib qolishi mumkin.\n"
+        "• Administrator backup yozuvlarini filtrlashi va tiklash uchun kerakli Telegram manziliga yuborishi mumkin.\n\n"
+        f"Shartlar versiyasi: <code>{TERMS_VERSION}</code>\n"
+        "Quyidagi tugmani bosish orqali ushbu shartlarga rozilik bildirasiz.",
+        reply_markup=ikb([[('✅ Roziman va davom etaman', 'terms:accept')]]),
+    )
+
+
 def file_actions(file_id: Any, favorite: bool = False) -> InlineKeyboardMarkup:
     fid = str(file_id)
     return ikb(
@@ -1836,20 +1883,24 @@ async def actor_user(
                 "🚫 Hisobingiz vaqtincha bloklangan. Administrator bilan bog‘laning."
             )
         return None
-    if not user["onboarding_completed"] and not allow_incomplete:
+    if (
+        not user["onboarding_completed"] or not terms_are_current(user)
+    ) and not allow_incomplete:
         target = event.message if isinstance(event, CallbackQuery) else event
         if isinstance(event, CallbackQuery):
             await event.answer("Avval ro‘yxatdan o‘tishni yakunlang.", show_alert=True)
-        if user["display_name"]:
+        if not user["display_name"]:
+            await target.answer(
+                "👤 Ro‘yxatdan o‘tishni boshlash uchun /start yuboring.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        elif not user["phone"]:
             await target.answer(
                 "📱 KeepGram’dan foydalanish uchun telefon raqamingizni pastdagi tugma orqali yuboring.",
                 reply_markup=ONBOARDING_PHONE_KEYBOARD,
             )
         else:
-            await target.answer(
-                "👤 Ro‘yxatdan o‘tishni boshlash uchun /start yuboring.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
+            await send_terms(target)
         return None
     return user
 
@@ -2253,7 +2304,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     user = await actor_user(message, allow_incomplete=True)
     if not user:
         return
-    if not user["onboarding_completed"]:
+    if not user["onboarding_completed"] or not terms_are_current(user):
         if not user["display_name"]:
             await state.set_state(Flow.onboarding_name)
             await message.answer(
@@ -2263,19 +2314,20 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
                 "👤 <b>Ismingizni yozib yuboring:</b>",
                 reply_markup=ReplyKeyboardRemove(),
             )
-        else:
+        elif not user["phone"]:
             await message.answer(
                 f"Salom, <b>{esc(user['display_name'])}</b>! Endi telefon raqamingizni tasdiqlang.",
                 reply_markup=ONBOARDING_PHONE_KEYBOARD,
             )
+        else:
+            await send_terms(message)
         return
     storage = await db.storage_by_tg(message.from_user.id)
     text = (
         "👋 <b>Assalomu alaykum! Men KeepGram — shaxsiy Telegram fayl omboringizman.</b>\n\n"
         "📦 Fayllarni o‘zingizning shaxsiy kanalingizda saqlayman\n"
         "🔎 Nomi, katalogi yoki tegi orqali topaman\n"
-        "🔢 Maxsus kod bilan bir zumda qaytaraman\n\n"
-        "Men faylni serverga yuklamayman — Telegram ichida nusxalayman."
+        "🔢 Maxsus kod bilan bir zumda qaytaraman"
     )
     rows = [[("ℹ️ Qanday ishlaydi?", "info:how"), ("🔐 Maxfiylik", "info:privacy")]]
     if not storage:
@@ -2346,15 +2398,15 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(Command("privacy"), F.chat.type == ChatType.PRIVATE)
 async def cmd_privacy(message: Message) -> None:
-    if not await actor_user(message):
+    if not await actor_user(message, allow_incomplete=True):
         return
     await message.answer(
-        "🔐 <b>Maxfiylik</b>\n\nFayllar KeepGram serverida saqlanmaydi; ular siz ulagan Telegram kanalida qoladi. "
-        "Bazaga faqat nom, kod, katalog, teg, kanal ID va xabar ID kabi indeks metadata yoziladi. "
+        "🔐 <b>Maxfiylik va backup</b>\n\nFayllar siz ulagan Telegram kanalida saqlanadi. "
+        "Bazaga nom, kod, katalog, teg, kanal ID va xabar ID kabi indeks metadata yoziladi. "
         "Ism va telefon raqami ro‘yxatdan o‘tish uchun majburiy; telefon faqat o‘zingiz Telegram kontakt tugmasi orqali tasdiqlaganingizda saqlanadi. "
-        "ADMIN_TELEGRAM_IDS ichidagi bot egasiga tegishli fayllar, egasi admin panelda owner-backup kanalini yoqqan bo‘lsa, "
-        "Telegram ichidagi alohida avariya kanaliga ham nusxalanadi; oddiy foydalanuvchilar fayli bu kanalga olinmaydi. "
-        "Kanal va Telegram hisobingiz xavfsizligi sizning nazoratingizda."
+        "Foydalanish shartlariga rozilik berganingizdan keyin botga yuborgan fayllaringiz, admin backupni yoqqan bo‘lsa, "
+        "avariya holatida tiklash uchun administrator boshqaradigan alohida Telegram backup kanaliga ham nusxalanadi. "
+        "Rozilik sanasi va shartlar versiyasi bazada qayd etiladi. Kanal va Telegram hisobingiz xavfsizligi sizning nazoratingizda."
     )
 
 
@@ -2371,12 +2423,13 @@ async def info_how(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "info:privacy")
 async def info_privacy(callback: CallbackQuery) -> None:
-    if not await actor_user(callback):
+    if not await actor_user(callback, allow_incomplete=True):
         return
     await callback.answer()
     await callback.message.answer(
-        "Fayl baytlari Render’ga yuklab olinmaydi; Telegram <code>copyMessage</code> amali va kichik metadata indeksi ishlatiladi. "
-        "Bot egasi ADMIN_TELEGRAM_IDS ro‘yxatida bo‘lsa, admin panelda yoqilgan owner-backup ham faqat uning o‘z fayllariga tatbiq etiladi."
+        "Fayllar Telegram ichida nusxalanadi va kichik metadata indeksi ishlatiladi. "
+        "Foydalanish shartlariga rozilik bergan foydalanuvchining fayllari, backup yoqilgan bo‘lsa, "
+        "tiklash uchun administrator boshqaradigan alohida Telegram kanaliga ham nusxalanadi."
     )
 
 
@@ -2770,21 +2823,21 @@ async def save_contact_or_phone(message: Message, state: FSMContext) -> None:
                 "Avval ismingizni yozib yuboring:", reply_markup=ReplyKeyboardRemove()
             )
             return
-        if not user["onboarding_completed"]:
-            completed = await db.complete_onboarding(
+        if not user["onboarding_completed"] or not terms_are_current(user):
+            saved = await db.save_onboarding_phone(
                 message.from_user.id, message.contact.phone_number
             )
-            if not completed:
+            if not saved:
                 await message.answer(
                     "Ro‘yxatdan o‘tishni yakunlab bo‘lmadi. /start orqali qayta urinib ko‘ring."
                 )
                 return
             await state.clear()
             await message.answer(
-                "✅ <b>Ro‘yxatdan o‘tish yakunlandi!</b>\n\nEndi KeepGram’dan foydalanishingiz mumkin.",
-                reply_markup=MAIN_MENU,
+                "✅ Telefon raqamingiz tasdiqlandi. Endi foydalanish shartlarini o‘qib chiqing.",
+                reply_markup=ReplyKeyboardRemove(),
             )
-            await cmd_start(message, state)
+            await send_terms(message)
             return
         await db.update_phone(message.from_user.id, message.contact.phone_number)
         await state.clear()
@@ -2793,7 +2846,7 @@ async def save_contact_or_phone(message: Message, state: FSMContext) -> None:
             reply_markup=MAIN_MENU,
         )
     else:
-        if not user["onboarding_completed"]:
+        if not user["onboarding_completed"] or not terms_are_current(user):
             await message.answer(
                 "⚠️ Faqat o‘zingizning telefon raqamingizni pastdagi maxsus tugma orqali yuboring.",
                 reply_markup=ONBOARDING_PHONE_KEYBOARD,
@@ -2801,6 +2854,55 @@ async def save_contact_or_phone(message: Message, state: FSMContext) -> None:
             return
         await state.clear()
         await save_message(message)
+
+
+@router.callback_query(F.data == "terms:accept")
+async def accept_terms(callback: CallbackQuery, state: FSMContext) -> None:
+    user = await actor_user(callback, allow_incomplete=True)
+    if not user:
+        return
+    if user["onboarding_completed"] and terms_are_current(user):
+        await callback.answer("Siz shartlarga allaqachon rozilik bergansiz.", show_alert=True)
+        return
+    if not user["display_name"] or not user["phone"]:
+        await callback.answer(
+            "Avval ism va telefon raqamingizni kiriting.", show_alert=True
+        )
+        return
+    accepted = await db.accept_terms(callback.from_user.id, TERMS_VERSION)
+    if not accepted:
+        await callback.answer("Rozilikni saqlab bo‘lmadi.", show_alert=True)
+        return
+    await db.audit(
+        "user",
+        str(callback.from_user.id),
+        "accept_terms",
+        "terms",
+        TERMS_VERSION,
+        {"backup_consent": True},
+    )
+    backup_config = await db.super_backup_config()
+    if backup_config["super_backup_enabled"] and backup_config[
+        "super_backup_channel_id"
+    ]:
+        await db.enqueue_existing_consented_backups(
+            TERMS_VERSION, int(backup_config["super_backup_channel_id"])
+        )
+    await state.clear()
+    await callback.answer("Roziligingiz saqlandi.", show_alert=True)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer(
+        "✅ <b>Ro‘yxatdan o‘tish yakunlandi!</b>\n\nEndi KeepGram’dan foydalanishingiz mumkin.",
+        reply_markup=MAIN_MENU,
+    )
+    if not await db.storage_by_tg(callback.from_user.id):
+        await callback.message.answer(
+            "Boshlash uchun shaxsiy Telegram kanalingizni ulang:",
+            reply_markup=ikb([[('🔗 Kanalni ulash', 'channel:link')]]),
+        )
 
 
 @router.message(Command("recent"), F.chat.type == ChatType.PRIVATE)
@@ -3655,7 +3757,7 @@ async def telegram_admin(message: Message) -> None:
 
 @router.message(Command("delete_my_data"), F.chat.type == ChatType.PRIVATE)
 async def delete_my_data_begin(message: Message, state: FSMContext) -> None:
-    if not await actor_user(message):
+    if not await actor_user(message, allow_incomplete=True):
         return
     await state.set_state(Flow.delete_account)
     await message.answer(
@@ -3703,19 +3805,22 @@ async def cancel(message: Message, state: FSMContext) -> None:
     user = await actor_user(message, allow_incomplete=True)
     if not user:
         return
-    if not user["onboarding_completed"]:
+    if not user["onboarding_completed"] or not terms_are_current(user):
         if not user["display_name"]:
             await state.set_state(Flow.onboarding_name)
             await message.answer(
                 "Ro‘yxatdan o‘tish majburiy. Davom etish uchun ismingizni yozing:",
                 reply_markup=ReplyKeyboardRemove(),
             )
-        else:
+        elif not user["phone"]:
             await state.clear()
             await message.answer(
                 "Ro‘yxatdan o‘tish majburiy. Telefon raqamingizni tasdiqlang:",
                 reply_markup=ONBOARDING_PHONE_KEYBOARD,
             )
+        else:
+            await state.clear()
+            await send_terms(message)
         return
     await state.clear()
     await message.answer("Amal bekor qilindi.", reply_markup=MAIN_MENU)
@@ -3851,7 +3956,7 @@ def backup_asset_card(row: Any) -> str:
     }.get(str(row["status"]), str(row["status"]))
     created = row["created_at"].astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
     return (
-        "🛡 <b>KEEPGRAM OWNER BACKUP</b>\n\n"
+        "🛡 <b>KEEPGRAM CONSENTED BACKUP</b>\n\n"
         f"👤 Egasi: {esc(row['owner_name'] or 'Noma’lum')}"
         f"{(' (@' + esc(row['owner_username']) + ')') if row['owner_username'] else ''}\n"
         f"🆔 Telegram ID: <code>{row['owner_telegram_id']}</code>\n"
@@ -3868,7 +3973,8 @@ def backup_asset_card(row: Any) -> str:
 
 
 async def super_backup_allowed(telegram_id: int) -> bool:
-    return telegram_id in configured_admin_telegram_ids()
+    user = await db.user_by_tg(telegram_id)
+    return bool(user and user["onboarding_completed"] and terms_are_current(user))
 
 
 async def process_super_backup_asset(row: asyncpg.Record) -> None:
@@ -3904,8 +4010,8 @@ async def super_backup_worker() -> None:
     while True:
         try:
             await db.requeue_stale_super_backups()
-            for candidate in await db.pending_super_backups():
-                row = await db.claim_super_backup(candidate["id"])
+            for candidate in await db.pending_super_backups(TERMS_VERSION):
+                row = await db.claim_super_backup(candidate["id"], TERMS_VERSION)
                 if not row:
                     continue
                 try:
@@ -3960,7 +4066,7 @@ async def flush_pending_super_backup(
         if latest["status"] == "failed":
             return False
         if latest["status"] == "pending":
-            row = await db.claim_super_backup(latest["id"])
+            row = await db.claim_super_backup(latest["id"], TERMS_VERSION)
             if row:
                 try:
                     await process_super_backup_asset(row)
@@ -4258,7 +4364,8 @@ async def admin_users(
     )
     rows = await db.ready().fetch(
         f"""SELECT u.id,u.telegram_id,u.username,COALESCE(u.display_name,u.first_name) AS first_name,
-                   u.last_name,u.phone,u.onboarding_completed,u.is_blocked,
+                   u.last_name,u.phone,u.onboarding_completed,u.terms_accepted_at,
+                   u.terms_version,u.is_blocked,
                    u.created_at,u.last_seen_at,s.channel_title,s.telegram_channel_id,
                    COALESCE(sum(f.item_count) FILTER(WHERE f.deleted_at IS NULL),0)::int file_count
             FROM users u LEFT JOIN storage_channels s ON s.user_id=u.id
@@ -4400,6 +4507,12 @@ async def admin_files(
 @app.get("/api/admin/backup/settings")
 async def admin_backup_settings(_: str = Depends(session_admin)) -> dict[str, Any]:
     config = await db.super_backup_config()
+    consented_users = await db.ready().fetchval(
+        """SELECT count(*) FROM users
+           WHERE onboarding_completed AND terms_accepted_at IS NOT NULL
+             AND terms_version=$1""",
+        TERMS_VERSION,
+    )
     channel_title: str | None = None
     if config["super_backup_channel_id"]:
         try:
@@ -4410,7 +4523,8 @@ async def admin_backup_settings(_: str = Depends(session_admin)) -> dict[str, An
     return {
         **jsonable(config),
         "channel_title": channel_title,
-        "allowed_owner_ids": sorted(configured_admin_telegram_ids()),
+        "terms_version": TERMS_VERSION,
+        "consented_users": int(consented_users),
     }
 
 
@@ -4422,10 +4536,6 @@ async def admin_update_backup_settings(
     if body.enabled:
         if not channel_id:
             raise HTTPException(422, "Backup kanal ID majburiy")
-        if not configured_admin_telegram_ids():
-            raise HTTPException(
-                422, "Avval ADMIN_TELEGRAM_IDS ichiga o‘zingizning Telegram ID’ingizni yozing"
-            )
         used = await db.ready().fetchval(
             "SELECT EXISTS(SELECT 1 FROM storage_channels WHERE telegram_channel_id=$1)",
             channel_id,
@@ -4458,8 +4568,8 @@ async def admin_update_backup_settings(
     row = await db.set_super_backup_config(body.enabled, channel_id)
     queued = 0
     if body.enabled and channel_id:
-        queued = await db.enqueue_existing_owner_backups(
-            sorted(configured_admin_telegram_ids()), channel_id
+        queued = await db.enqueue_existing_consented_backups(
+            TERMS_VERSION, channel_id
         )
     await admin_log(
         admin,

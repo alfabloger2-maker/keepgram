@@ -15,6 +15,8 @@ create table if not exists users (
   language_code text,
   onboarding_completed boolean not null default false,
   onboarded_at timestamptz,
+  terms_accepted_at timestamptz,
+  terms_version varchar(16),
   is_blocked boolean not null default false,
   created_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now()
@@ -24,6 +26,8 @@ create table if not exists users (
 alter table users add column if not exists display_name text;
 alter table users add column if not exists onboarding_completed boolean not null default false;
 alter table users add column if not exists onboarded_at timestamptz;
+alter table users add column if not exists terms_accepted_at timestamptz;
+alter table users add column if not exists terms_version varchar(16);
 
 create table if not exists storage_channels (
   id uuid primary key default gen_random_uuid(),

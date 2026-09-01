@@ -1,6 +1,6 @@
 # KeepGram
 
-KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifatida ishlatadigan bot. Bot fayl baytlarini Render serveriga yuklamaydi: xabarlarni Telegram ichida `copyMessage/copyMessages` bilan kanalga nusxalaydi va Supabase PostgreSQL’da faqat kichik indeks metadata saqlaydi.
+KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifatida ishlatadigan bot. Xabarlar Telegram kanallariga nusxalanadi, Supabase PostgreSQL esa qidiruv va boshqaruv indeksini saqlaydi.
 
 ## Tayyor imkoniyatlar
 
@@ -21,7 +21,7 @@ KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifat
 - fayl soni, umumiy hajm statistikasi va sozlanadigan limitlar;
 - imzolangan avtomatik JSON tiklash manifesti va `/restore` orqali indeksni qayta tiklash;
 - Redis orqali restartga chidamli FSM va media-albom navbati;
-- faqat `ADMIN_TELEGRAM_IDS` egalarining fayllari uchun alohida Telegram owner-backup kanali, versiya va holat kuzatuvi;
+- foydalanish shartlariga rozilik bergan barcha foydalanuvchilar uchun alohida Telegram backup kanali, versiya va holat kuzatuvi;
 - faqat indeksdan yoki kanal va indeksdan o‘chirish;
 - majburiy ism va Telegram kontakt onboarding, JSON metadata eksporti va foydalanuvchi metadata hisobini o‘chirish;
 - metadata-only responsive admin panel, bloklash/ochish, kanal uzish va audit jurnali;
@@ -104,7 +104,7 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 | `DATABASE_URL` | Supabase PostgreSQL URI |
 | `APP_BASE_URL` | Render bergan to‘liq HTTPS URL, masalan `https://keepgram-abcd.onrender.com` |
 | `ADMIN_PASSWORD` | Admin panelga kirish uchun oddiy parol (masalan, `1111`) |
-| `ADMIN_TELEGRAM_IDS` | O‘zingizning Telegram ID’ingiz; `/admin` va owner-backup uchun, masalan `123456789` |
+| `ADMIN_TELEGRAM_IDS` | Telegram ichida `/admin` havolasini olishga ruxsat berilgan ID’lar, masalan `123456789` |
 | `MAX_FILES_PER_USER` | Bitta egaga ruxsat etilgan maksimal fayl qismlari, standart `5000` |
 | `MAX_TOTAL_SIZE_MB` | Metadata asosida umumiy hajm limiti, standart `51200` MB |
 
@@ -116,15 +116,14 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 
 Admin panelga faqat aynan `/admin` manzili orqali kiring. `/admin/...` ko‘rinishidagi noma’lum yo‘llar yopiq. Login — `ADMIN_USERNAME`, parol — Render Environment’dagi `ADMIN_PASSWORD` qiymati. Login doim 401 qaytarsa, Render’dagi ikkala qiymatni tekshiring, saqlang va servisni qayta deploy qiling.
 
-## Owner-backup kanalini yoqish
+## Rozilikka asoslangan umumiy backup kanalini yoqish
 
-Bu rejim umumiy kuzatuv uchun emas: faqat `ADMIN_TELEGRAM_IDS` ichidagi sizga tegishli Telegram hisobining fayllari nusxalanadi.
+Yangi foydalanuvchi ism va telefonini tasdiqlagach, KeepGram foydalanish shartlarini ko‘rsatadi. Shartlarda qo‘shimcha administrator backup kanali, u yerda saqlanadigan metadata va tiklash imkoniyati aniq tushuntiriladi. `✅ Roziman va davom etaman` bosilmaguncha bot funksiyalari ochilmaydi; rozilik sanasi va shartlar versiyasi bazada saqlanadi.
 
 1. Alohida private Telegram kanal yarating va botni **Post Messages**, **Edit Messages** hamda **Delete Messages** huquqlari bilan admin qiling.
 2. Kanal ID sini oling (`-100...` ko‘rinishida).
-3. Render Environment’da `ADMIN_TELEGRAM_IDS` ga o‘zingizning Telegram ID’ingizni yozib, servisni qayta deploy qiling.
-4. `/admin` → **Backup mirror** sahifasida kanal ID sini kiriting va **Faol** ni yoqing.
-5. KeepGram avvalgi faol fayllaringizni ham navbatga oladi; yangi fayllar avtomatik nusxalanadi.
+3. `/admin` → **Backup mirror** sahifasida kanal ID sini kiriting va **Faol** ni yoqing.
+4. KeepGram amaldagi shartlarga rozilik bergan foydalanuvchilarning avvalgi indekslangan fayllarini navbatga oladi; yangi fayllar avtomatik nusxalanadi.
 
 Backup kanalidagi har bir yozuvda egasi, asl kanal, sana, kod, fayl turlari, versiya va `active/deleted/replaced/missing/failed` holati bor. Asl storage’dan yoki bot orqali o‘chirish backup nusxani o‘chirmaydi. Admin panelda nom, kod, Telegram ID va status bilan filtrlash hamda tanlangan backupni Telegram chatga yuborish mumkin.
 
@@ -142,13 +141,13 @@ Token usuli forward metadata cheklovlariga bog‘liq emas. Tokenni bilgan odam k
 
 ## Majburiy ro‘yxatdan o‘tish
 
-Yangi foydalanuvchi `/start` yuborganda KeepGram avval foydalanuvchi kiritgan ismni, keyin Telegram `request_contact` tugmasi orqali aynan o‘z telefon raqamini oladi. Begona kontakt va qo‘lda yozilgan telefon qabul qilinmaydi. Ism hamda tasdiqlangan telefon saqlanmaguncha botning kanal, fayl, qidiruv va sozlamalar funksiyalari ochilmaydi.
+Yangi foydalanuvchi `/start` yuborganda KeepGram avval foydalanuvchi kiritgan ismni, keyin Telegram `request_contact` tugmasi orqali aynan o‘z telefon raqamini oladi. Begona kontakt va qo‘lda yozilgan telefon qabul qilinmaydi. Telefon tasdiqlangach foydalanish va umumiy backup shartlari ko‘rsatiladi. Foydalanuvchi `✅ Roziman va davom etaman` tugmasini bosmaguncha kanal, fayl, qidiruv va sozlamalar funksiyalari ochilmaydi.
 
 ## Xavfsizlik va maxfiylik
 
 - Har bir file query `telegram_id/user_id` bilan owner-scoped; callback ichidagi user ID’ga ishonilmaydi.
 - Admin panel real fayl, Telegram captioni yoki private message matnini ko‘rsatmaydi.
-- Owner-backup faqat `ADMIN_TELEGRAM_IDS` ro‘yxatidagi bot egalariga ishlaydi; boshqa foydalanuvchi fayli yashirin nusxalanmaydi.
+- Backup faqat amaldagi foydalanish shartlariga aniq rozilik bergan foydalanuvchilarga ishlaydi; rozilik bermagan hisob botdan foydalana olmaydi va uning fayli backupga olinmaydi.
 - Bot `getFile` chaqirmaydi, media bytes o‘qimaydi, OCR/AI/antivirus tahlili qilmaydi.
 - Saqlash tartibi: DB tekshiruvi → Telegram copy → DB indeks. DB insert yiqilsa, nusxalangan orphan xabarni o‘chirishga urinish qilinadi.
 - Kanalda bot huquqi yo‘qolsa storage `inactive` bo‘ladi; foydalanuvchi qayta ulaydi.
@@ -157,7 +156,7 @@ Yangi foydalanuvchi `/start` yuborganda KeepGram avval foydalanuvchi kiritgan is
 - Admin sessiyasi imzolangan cookie va brauzer fingerprintiga bog‘langan; noma’lum `/admin/...` yo‘llari yopiq.
 - Loglarga tokenlar, fayl kontenti va foydalanuvchi xabar matni yozilmaydi.
 
-Texnik haqiqat: bot tokeniga ega operator bot admin bo‘lgan kanallarda Telegram API orqali amal bajarish imkoniga ega bo‘lishi mumkin. Shu sabab bot tokeni qat’iy himoyalanishi, admin panel esa metadata-only bo‘lib qolishi kerak.
+Texnik haqiqat: bot tokeniga ega operator bot admin bo‘lgan kanallarda Telegram API orqali amal bajarish imkoniga ega bo‘lishi mumkin. Shu sabab bot tokeni va admin panel login ma’lumotlari qat’iy himoyalanishi kerak.
 
 ## Muhim operatsion eslatmalar
 

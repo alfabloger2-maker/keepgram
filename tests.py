@@ -124,6 +124,21 @@ class KeepGramCoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             main.verify_manifest_bytes(raw, 456)
 
+    def test_terms_acceptance_requires_current_version(self):
+        self.assertTrue(
+            main.terms_are_current(
+                {"terms_accepted_at": "2026-09-01T00:00:00Z", "terms_version": main.TERMS_VERSION}
+            )
+        )
+        self.assertFalse(
+            main.terms_are_current(
+                {"terms_accepted_at": "2026-09-01T00:00:00Z", "terms_version": "old"}
+            )
+        )
+        self.assertFalse(
+            main.terms_are_current({"terms_accepted_at": None, "terms_version": None})
+        )
+
     def test_schema_contains_mandatory_onboarding_fields(self):
         schema = Path("schema.sql").read_text(encoding="utf-8")
         self.assertIn("display_name text", schema)
@@ -133,6 +148,8 @@ class KeepGramCoreTests(unittest.TestCase):
         self.assertIn("create table if not exists backup_assets", schema)
         self.assertIn("'processing'", schema)
         self.assertIn("manifest_message_id bigint", schema)
+        self.assertIn("terms_accepted_at timestamptz", schema)
+        self.assertIn("terms_version varchar(16)", schema)
 
 
 if __name__ == "__main__":
