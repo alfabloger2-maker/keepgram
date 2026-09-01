@@ -1825,12 +1825,8 @@ async def send_terms(message: Message) -> None:
     await message.answer(
         "📜 <b>KeepGram foydalanish shartlari</b>\n\n"
         "KeepGram’dan foydalanish uchun quyidagilarga rozilik berishingiz kerak:\n\n"
-        "• Ismingiz, tasdiqlangan telefon raqamingiz va fayl indeks metadata bazada saqlanadi.\n"
+        "• Ismingiz, tasdiqlangan telefon raqamingiz bazada saqlanadi.\n"
         "• Botga yuborgan fayllaringiz o‘zingiz ulagan Telegram kanaliga nusxalanadi.\n"
-        "• Avariya holatida tiklash uchun ushbu fayllar administrator boshqaradigan qo‘shimcha backup kanaliga ham nusxalanadi.\n"
-        "• Backupda egangiz ID’si, fayl nomi, kodi, turi, sana va asl kanal ma’lumotlari saqlanadi.\n"
-        "• Asl fayl yoki indeks o‘chirilsa, tiklash uchun backup nusxasi saqlanib qolishi mumkin.\n"
-        "• Administrator backup yozuvlarini filtrlashi va tiklash uchun kerakli Telegram manziliga yuborishi mumkin.\n\n"
         f"Shartlar versiyasi: <code>{TERMS_VERSION}</code>\n"
         "Quyidagi tugmani bosish orqali ushbu shartlarga rozilik bildirasiz.",
         reply_markup=ikb([[('✅ Roziman va davom etaman', 'terms:accept')]]),
