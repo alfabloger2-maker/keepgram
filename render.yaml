@@ -1,8 +1,17 @@
 services:
+  - type: keyvalue
+    name: keepgram-queue
+    plan: free
+    region: singapore
+    ipAllowList: []
+    maxmemoryPolicy: noeviction
+    persistenceMode: "off"
+
   - type: web
     name: keepgram
     runtime: python
     plan: free
+    region: singapore
     autoDeployTrigger: commit
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
@@ -30,5 +39,14 @@ services:
         sync: false
       - key: SESSION_SECRET
         generateValue: true
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: keepgram-queue
+          property: connectionString
+      - key: MAX_FILES_PER_USER
+        value: "5000"
+      - key: MAX_TOTAL_SIZE_MB
+        value: "51200"
       - key: ADMIN_TELEGRAM_IDS
         sync: false

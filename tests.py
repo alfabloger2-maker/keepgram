@@ -9,6 +9,8 @@ os.environ.setdefault("APP_BASE_URL", "https://example.com")
 os.environ.setdefault("WEBHOOK_SECRET", "abcdefghijklmnop")
 os.environ.setdefault("ADMIN_PASSWORD", "test-password")
 os.environ.setdefault("SESSION_SECRET", "01234567890123456789012345678901")
+os.environ.setdefault("MAX_FILES_PER_USER", "5000")
+os.environ.setdefault("MAX_TOTAL_SIZE_MB", "51200")
 
 import main
 
@@ -90,6 +92,37 @@ class KeepGramCoreTests(unittest.TestCase):
         self.assertIn("/admin", paths)
         self.assertIn("/admin/{unexpected_path:path}", paths)
         self.assertIn("/api/admin/session", paths)
+        self.assertIn("/api/admin/backup/settings", paths)
+        self.assertIn("/api/admin/backups", paths)
+        self.assertIn("/api/admin/backups/{backup_id}/send", paths)
+        self.assertIn("/api/admin/backups/{backup_id}/retry", paths)
+
+    def test_advanced_search_filters(self):
+        parsed = main.parse_search_query(
+            "passport type:pdf date:2026-09 catalog:Hujjat #muhim"
+        )
+        self.assertEqual(parsed["text"], "passport")
+        self.assertEqual(parsed["file_kind"], "pdf")
+        self.assertEqual(parsed["date_start"].isoformat(), "2026-09-01T00:00:00+00:00")
+        self.assertEqual(parsed["date_end"].isoformat(), "2026-10-01T00:00:00+00:00")
+        self.assertEqual(parsed["catalog"], "Hujjat")
+        self.assertEqual(parsed["tag"], "muhim")
+
+    def test_advanced_search_rejects_invalid_month(self):
+        with self.assertRaises(ValueError):
+            main.parse_search_query("date:2026-13")
+
+    def test_blank_redis_url_uses_memory_fallback(self):
+        configured = main.Settings(redis_url="")
+        self.assertIsNone(configured.redis_url)
+
+    def test_signed_manifest_is_owner_scoped(self):
+        raw = main.build_manifest_bytes({"owner_telegram_id": 123, "files": []})
+        self.assertEqual(
+            main.verify_manifest_bytes(raw, 123)["owner_telegram_id"], 123
+        )
+        with self.assertRaises(ValueError):
+            main.verify_manifest_bytes(raw, 456)
 
     def test_schema_contains_mandatory_onboarding_fields(self):
         schema = Path("schema.sql").read_text(encoding="utf-8")
@@ -97,6 +130,9 @@ class KeepGramCoreTests(unittest.TestCase):
         self.assertIn("onboarding_completed boolean not null default false", schema)
         self.assertIn("create table if not exists file_parts", schema)
         self.assertIn("file_kinds text[]", schema)
+        self.assertIn("create table if not exists backup_assets", schema)
+        self.assertIn("'processing'", schema)
+        self.assertIn("manifest_message_id bigint", schema)
 
 
 if __name__ == "__main__":

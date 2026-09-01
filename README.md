@@ -8,13 +8,20 @@ KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifat
 - 15 daqiqalik bir martalik `LINK-XXXXXXXX` token bilan xavfsiz kanal ulash;
 - document, photo, video, audio, voice, GIF, sticker, video-note, kontakt, lokatsiya va matn saqlash;
 - bir martada yuborilgan 2–10 ta media/faylni bitta kodli to‘plam sifatida saqlash va qaytarish;
+- `file_unique_id` orqali takroriy faylni aniqlash;
 - JPG/PNG va boshqa rasmlar, PDF, Word, Excel hamda boshqa fayllarni avtomatik turkumlash;
 - takrorlangan nomlarni avtomatik `Nomi (2)`, `Nomi (3)` ko‘rinishida noyob qilish;
 - nom, kod, tur va teglar ko‘rinadigan ixcham “Barcha saqlanganlar” menyusi;
 - fayl serverga yuklanmasdan Telegram ichida nusxalanishi;
 - chalkash belgilar olib tashlangan 6 belgili kod;
-- kod, nom, teg va katalog bo‘yicha owner-scoped qidiruv;
+- kod, nom, teg va katalog bo‘yicha owner-scoped qidiruv, `type:pdf` va `date:2026-09` kabi filtrlar;
 - kataloglar, teglar, sevimlilar, oxirgi fayllar, nomni tahrirlash;
+- ko‘p yozuvni belgilab umumiy teg/katalog berish yoki ommaviy o‘chirish;
+- fayl tarkibini kod, nom va teglarni saqlagan holda almashtirish;
+- fayl soni, umumiy hajm statistikasi va sozlanadigan limitlar;
+- imzolangan avtomatik JSON tiklash manifesti va `/restore` orqali indeksni qayta tiklash;
+- Redis orqali restartga chidamli FSM va media-albom navbati;
+- faqat `ADMIN_TELEGRAM_IDS` egalarining fayllari uchun alohida Telegram owner-backup kanali, versiya va holat kuzatuvi;
 - faqat indeksdan yoki kanal va indeksdan o‘chirish;
 - majburiy ism va Telegram kontakt onboarding, JSON metadata eksporti va foydalanuvchi metadata hisobini o‘chirish;
 - metadata-only responsive admin panel, bloklash/ochish, kanal uzish va audit jurnali;
@@ -97,15 +104,29 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 | `DATABASE_URL` | Supabase PostgreSQL URI |
 | `APP_BASE_URL` | Render bergan to‘liq HTTPS URL, masalan `https://keepgram-abcd.onrender.com` |
 | `ADMIN_PASSWORD` | Admin panelga kirish uchun oddiy parol (masalan, `1111`) |
-| `ADMIN_TELEGRAM_IDS` | Ixtiyoriy, `/admin` buyrug‘i uchun IDlar: `123,456` |
+| `ADMIN_TELEGRAM_IDS` | O‘zingizning Telegram ID’ingiz; `/admin` va owner-backup uchun, masalan `123456789` |
+| `MAX_FILES_PER_USER` | Bitta egaga ruxsat etilgan maksimal fayl qismlari, standart `5000` |
+| `MAX_TOTAL_SIZE_MB` | Metadata asosida umumiy hajm limiti, standart `51200` MB |
 
-`WEBHOOK_SECRET` va `SESSION_SECRET` Blueprint tomonidan avtomatik yaratiladi. Agar servisni Blueprint’siz qo‘lda yaratsangiz, ularni ham o‘zingiz kiriting.
+`WEBHOOK_SECRET` va `SESSION_SECRET` Blueprint tomonidan avtomatik yaratiladi. `keepgram-queue` Render Key Value ham yaratiladi va uning ichki `REDIS_URL` manzili web-servisga avtomatik ulanadi. Agar servisni Blueprint’siz qo‘lda yaratsangiz, ushbu qiymatlarni o‘zingiz kiriting.
 
 5. Deploy tugagach `https://SIZNING-SERVIS.onrender.com/health` manzilida `status: ok`, `database: true` va `schema: true` ko‘rinishi kerak.
 6. Botga `/start` yuboring. Webhook ilova ishga tushganida avtomatik o‘rnatiladi.
 7. Admin panel: `https://SIZNING-SERVIS.onrender.com/admin`.
 
 Admin panelga faqat aynan `/admin` manzili orqali kiring. `/admin/...` ko‘rinishidagi noma’lum yo‘llar yopiq. Login — `ADMIN_USERNAME`, parol — Render Environment’dagi `ADMIN_PASSWORD` qiymati. Login doim 401 qaytarsa, Render’dagi ikkala qiymatni tekshiring, saqlang va servisni qayta deploy qiling.
+
+## Owner-backup kanalini yoqish
+
+Bu rejim umumiy kuzatuv uchun emas: faqat `ADMIN_TELEGRAM_IDS` ichidagi sizga tegishli Telegram hisobining fayllari nusxalanadi.
+
+1. Alohida private Telegram kanal yarating va botni **Post Messages**, **Edit Messages** hamda **Delete Messages** huquqlari bilan admin qiling.
+2. Kanal ID sini oling (`-100...` ko‘rinishida).
+3. Render Environment’da `ADMIN_TELEGRAM_IDS` ga o‘zingizning Telegram ID’ingizni yozib, servisni qayta deploy qiling.
+4. `/admin` → **Backup mirror** sahifasida kanal ID sini kiriting va **Faol** ni yoqing.
+5. KeepGram avvalgi faol fayllaringizni ham navbatga oladi; yangi fayllar avtomatik nusxalanadi.
+
+Backup kanalidagi har bir yozuvda egasi, asl kanal, sana, kod, fayl turlari, versiya va `active/deleted/replaced/missing/failed` holati bor. Asl storage’dan yoki bot orqali o‘chirish backup nusxani o‘chirmaydi. Admin panelda nom, kod, Telegram ID va status bilan filtrlash hamda tanlangan backupni Telegram chatga yuborish mumkin.
 
 Keyingi GitHub commitlari Render’da avtomatik deploy bo‘ladi.
 
@@ -127,6 +148,7 @@ Yangi foydalanuvchi `/start` yuborganda KeepGram avval foydalanuvchi kiritgan is
 
 - Har bir file query `telegram_id/user_id` bilan owner-scoped; callback ichidagi user ID’ga ishonilmaydi.
 - Admin panel real fayl, Telegram captioni yoki private message matnini ko‘rsatmaydi.
+- Owner-backup faqat `ADMIN_TELEGRAM_IDS` ro‘yxatidagi bot egalariga ishlaydi; boshqa foydalanuvchi fayli yashirin nusxalanmaydi.
 - Bot `getFile` chaqirmaydi, media bytes o‘qimaydi, OCR/AI/antivirus tahlili qilmaydi.
 - Saqlash tartibi: DB tekshiruvi → Telegram copy → DB indeks. DB insert yiqilsa, nusxalangan orphan xabarni o‘chirishga urinish qilinadi.
 - Kanalda bot huquqi yo‘qolsa storage `inactive` bo‘ladi; foydalanuvchi qayta ulaydi.
@@ -139,15 +161,16 @@ Texnik haqiqat: bot tokeniga ega operator bot admin bo‘lgan kanallarda Telegra
 
 ## Muhim operatsion eslatmalar
 
-- Supabase bazasi indeksdir. Uni yo‘qotsangiz, Telegram kanaldagi fayllar qoladi, lekin KeepGram eski kod va qidiruv bilan ularni topolmaydi. Database backup yoqing.
+- Supabase bazasi indeksdir. Avto-manifest har o‘zgarishdan keyin storage kanalga imzolangan tiklash faylini joylaydi; `SESSION_SECRET` ni almashtirmang, aks holda eski manifest imzosi tekshiruvdan o‘tmaydi. Supabase backupni ham yoqing.
 - Foydalanuvchi faylni kanaldan qo‘lda o‘chirsa, keyingi olishda KeepGram indeksni `missing` deb belgilaydi.
 - Kanal almashtirilganda eski kanal fayllari qoladi, eski kanalga tegishli indeks tozalanadi.
-- Memory FSM faqat juda qisqa rename/tag/qidiruv dialoglari uchun ishlatiladi; media albomi qismlari 1,2 soniya yig‘ilib, keyin bitta indeks sifatida saqlanadi.
+- Redis mavjud bo‘lsa FSM va media-albom navbati restartdan keyin ham davom etadi; bo‘lmasa xavfsiz memory fallback ishlaydi. Render free Key Value diskka doimiy yozmaydi, shu sabab eng kuchli kafolat uchun pullik persistence rejimi kerak.
+- Web-servis bitta worker bilan ishlaydi, PostgreSQL pool 5 ulanish bilan cheklangan, backup/manifest fon ishlari kichik paketlarda bajariladi. Bu 512 MB Render servisida keskin yuklanishni kamaytiradi.
 - `/health` endpoint Render health-check uchun, `/ping` esa tashqi uptime tekshiruvi uchun tayyor.
 
 ## Asosiy buyruqlar
 
-`/start`, `/menu`, `/search`, `/recent`, `/all`, `/catalogs`, `/tags`, `/settings`, `/channel`, `/disconnect`, `/mydata`, `/delete_my_data`, `/privacy`, `/help`, `/cancel`, `/admin`.
+`/start`, `/menu`, `/search`, `/recent`, `/all`, `/stats`, `/catalogs`, `/tags`, `/settings`, `/channel`, `/disconnect`, `/backup`, `/restore`, `/mydata`, `/delete_my_data`, `/privacy`, `/help`, `/cancel`, `/admin`.
 
 ## Litsenziya va foydalanish
 

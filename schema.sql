@@ -32,18 +32,28 @@ create table if not exists storage_channels (
   channel_title text,
   channel_username text,
   is_active boolean not null default true,
+  manifest_message_id bigint,
+  manifest_dirty_at timestamptz,
+  manifest_updated_at timestamptz,
   linked_at timestamptz not null default now()
 );
+
+alter table storage_channels add column if not exists manifest_message_id bigint;
+alter table storage_channels add column if not exists manifest_dirty_at timestamptz;
+alter table storage_channels add column if not exists manifest_updated_at timestamptz;
 
 create table if not exists user_settings (
   user_id uuid primary key references users(id) on delete cascade,
   default_catalog text not null default 'Umumiy',
   index_message_enabled boolean not null default false,
   default_favorite boolean not null default false,
+  auto_manifest_enabled boolean not null default true,
   language text not null default 'uz',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table user_settings add column if not exists auto_manifest_enabled boolean not null default true;
 
 create table if not exists catalogs (
   id uuid primary key default gen_random_uuid(),
@@ -145,14 +155,60 @@ create table if not exists audit_logs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists app_settings (
+  singleton boolean primary key default true check (singleton),
+  super_backup_enabled boolean not null default false,
+  super_backup_channel_id bigint,
+  updated_at timestamptz not null default now()
+);
+
+insert into app_settings(singleton) values(true) on conflict(singleton) do nothing;
+
+create table if not exists backup_assets (
+  id uuid primary key default gen_random_uuid(),
+  file_id uuid references files(id) on delete set null,
+  owner_telegram_id bigint not null,
+  owner_name text,
+  owner_username text,
+  version integer not null default 1,
+  status varchar(16) not null default 'pending'
+    check (status in ('pending','processing','active','deleted','replaced','missing','failed')),
+  title text not null,
+  code varchar(6) not null,
+  file_kinds text[] not null default '{}',
+  item_count integer not null default 1,
+  source_channel_id bigint not null,
+  source_channel_title text,
+  source_message_ids bigint[] not null,
+  backup_channel_id bigint,
+  backup_message_ids bigint[],
+  index_message_id bigint,
+  error_message text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(file_id, version)
+);
+
+alter table backup_assets add column if not exists owner_name text;
+alter table backup_assets add column if not exists owner_username text;
+alter table backup_assets add column if not exists source_channel_title text;
+alter table backup_assets drop constraint if exists backup_assets_status_check;
+alter table backup_assets add constraint backup_assets_status_check
+  check (status in ('pending','processing','active','deleted','replaced','missing','failed'));
+
 create index if not exists files_user_created_idx on files(user_id, created_at desc);
 create index if not exists files_user_code_idx on files(user_id, code);
 create index if not exists files_user_catalog_idx on files(user_id, catalog);
 create index if not exists files_tags_gin_idx on files using gin(tags);
+create index if not exists files_kinds_gin_idx on files using gin(file_kinds);
 create index if not exists files_title_trgm_idx on files using gin(lower(title) gin_trgm_ops);
 create index if not exists file_parts_file_position_idx on file_parts(file_id, position);
+create index if not exists file_parts_unique_id_idx
+  on file_parts(telegram_file_unique_id) where telegram_file_unique_id is not null;
 create index if not exists users_last_seen_idx on users(last_seen_at desc);
 create index if not exists audit_logs_created_idx on audit_logs(created_at desc);
+create index if not exists backup_assets_status_created_idx on backup_assets(status, created_at);
+create index if not exists backup_assets_owner_idx on backup_assets(owner_telegram_id, created_at desc);
 create index if not exists link_tokens_expiry_idx on channel_link_tokens(expires_at);
 
 create or replace function set_updated_at() returns trigger language plpgsql as $$
@@ -179,6 +235,9 @@ alter table files enable row level security;
 alter table file_parts enable row level security;
 alter table channel_link_tokens enable row level security;
 alter table audit_logs enable row level security;
+alter table app_settings enable row level security;
+alter table backup_assets enable row level security;
 
 revoke all on table users, storage_channels, user_settings, catalogs, files, file_parts,
   channel_link_tokens, audit_logs from anon, authenticated;
+revoke all on table app_settings, backup_assets from anon, authenticated;

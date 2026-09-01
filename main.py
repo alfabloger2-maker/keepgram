@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import html
+import io
 import json
 import logging
 import re
@@ -25,6 +26,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
@@ -41,10 +43,11 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from redis.asyncio import Redis
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_NAME = "KeepGram"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 BASE_DIR = Path(__file__).resolve().parent
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_RE = re.compile(r"^[A-HJ-NP-Z2-9]{6}$", re.IGNORECASE)
@@ -81,9 +84,19 @@ class Settings(BaseSettings):
     admin_password: SecretStr
     admin_telegram_ids: str = ""
     session_secret: SecretStr
+    redis_url: SecretStr | None = None
+    max_files_per_user: int = 5_000
+    max_total_size_mb: int = 51_200
     app_env: str = "production"
     log_level: str = "INFO"
     webhook_drop_pending_updates: bool = False
+
+    @field_validator("redis_url", mode="before")
+    @classmethod
+    def normalize_optional_redis_url(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return value
 
     @field_validator("app_base_url")
     @classmethod
@@ -126,6 +139,20 @@ class Settings(BaseSettings):
             raise ValueError("SESSION_SECRET kamida 32 belgi bo‘lishi kerak")
         return value
 
+    @field_validator("max_files_per_user")
+    @classmethod
+    def validate_file_limit(cls, value: int) -> int:
+        if not 100 <= value <= 1_000_000:
+            raise ValueError("MAX_FILES_PER_USER 100-1000000 oralig‘ida bo‘lsin")
+        return value
+
+    @field_validator("max_total_size_mb")
+    @classmethod
+    def validate_size_limit(cls, value: int) -> int:
+        if not 100 <= value <= 10_000_000:
+            raise ValueError("MAX_TOTAL_SIZE_MB 100-10000000 oralig‘ida bo‘lsin")
+        return value
+
 
 settings = Settings()
 logging.basicConfig(
@@ -149,6 +176,55 @@ def jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [jsonable(item) for item in value]
     return value
+
+
+def build_manifest_bytes(payload: dict[str, Any]) -> bytes:
+    manifest = {
+        "schema_version": 1,
+        "app_version": APP_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "data": jsonable(payload),
+    }
+    canonical = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    signature = hmac.new(
+        settings.session_secret.get_secret_value().encode("utf-8"),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+    return json.dumps(
+        {"manifest": manifest, "signature": signature},
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+
+
+def verify_manifest_bytes(raw: bytes, telegram_id: int) -> dict[str, Any]:
+    if len(raw) > 2 * 1024 * 1024:
+        raise ValueError("Manifest hajmi 2 MB dan katta")
+    try:
+        envelope = json.loads(raw.decode("utf-8"))
+        manifest = envelope["manifest"]
+        supplied = str(envelope["signature"])
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError("Manifest JSON formati noto‘g‘ri") from exc
+    canonical = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    expected = hmac.new(
+        settings.session_secret.get_secret_value().encode("utf-8"),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, supplied):
+        raise ValueError("Manifest imzosi noto‘g‘ri yoki fayl o‘zgartirilgan")
+    if int(manifest.get("schema_version", 0)) != 1:
+        raise ValueError("Manifest versiyasi qo‘llab-quvvatlanmaydi")
+    data = manifest.get("data")
+    if not isinstance(data, dict) or int(data.get("owner_telegram_id", 0)) != telegram_id:
+        raise ValueError("Manifest boshqa foydalanuvchiga tegishli")
+    return data
 
 
 def esc(value: Any) -> str:
@@ -177,6 +253,71 @@ def normalize_tags(raw: str) -> list[str]:
         if tag and tag not in result:
             result.append(tag)
     return result[:10]
+
+
+SEARCH_TYPE_ALIASES = {
+    "rasm": "image",
+    "image": "image",
+    "jpg": "image",
+    "jpeg": "image",
+    "png": "image",
+    "pdf": "pdf",
+    "word": "word",
+    "doc": "word",
+    "docx": "word",
+    "excel": "excel",
+    "xls": "excel",
+    "xlsx": "excel",
+    "csv": "excel",
+    "video": "video",
+    "audio": "audio",
+    "matn": "text",
+    "text": "text",
+    "boshqa": "other",
+    "other": "other",
+}
+
+
+def parse_search_query(query: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "text": "",
+        "file_kind": None,
+        "date_start": None,
+        "date_end": None,
+        "catalog": None,
+        "tag": None,
+    }
+    text_parts: list[str] = []
+    for token in query.strip().split():
+        lowered = token.casefold()
+        if lowered.startswith("type:"):
+            requested = lowered.split(":", 1)[1]
+            kind = SEARCH_TYPE_ALIASES.get(requested)
+            if not kind:
+                raise ValueError("Noma’lum tur. Masalan: type:pdf yoki type:excel")
+            result["file_kind"] = kind
+        elif lowered.startswith("date:"):
+            raw_date = lowered.split(":", 1)[1]
+            if not re.fullmatch(r"\d{4}-\d{2}", raw_date):
+                raise ValueError("Sana YYYY-MM ko‘rinishida bo‘lsin. Masalan: date:2026-09")
+            year, month = (int(part) for part in raw_date.split("-"))
+            if not 1 <= month <= 12:
+                raise ValueError("Oy 01-12 oralig‘ida bo‘lsin")
+            result["date_start"] = datetime(year, month, 1, tzinfo=timezone.utc)
+            result["date_end"] = (
+                datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+                if month == 12
+                else datetime(year, month + 1, 1, tzinfo=timezone.utc)
+            )
+        elif lowered.startswith("catalog:"):
+            result["catalog"] = token.split(":", 1)[1][:40]
+        elif token.startswith("#") and len(token) > 1:
+            tags = normalize_tags(token)
+            result["tag"] = tags[0] if tags else None
+        else:
+            text_parts.append(token)
+    result["text"] = " ".join(text_parts)[:100]
+    return result
 
 
 def file_extension(file_name: str | None) -> str | None:
@@ -376,7 +517,7 @@ class Database:
         self.pool = await asyncpg.create_pool(
             self.dsn,
             min_size=1,
-            max_size=8,
+            max_size=5,
             command_timeout=20,
             statement_cache_size=0,
             ssl=ssl,
@@ -411,6 +552,8 @@ class Database:
                        AND to_regclass('public.file_parts') IS NOT NULL
                        AND to_regclass('public.channel_link_tokens') IS NOT NULL
                        AND to_regclass('public.audit_logs') IS NOT NULL
+                       AND to_regclass('public.app_settings') IS NOT NULL
+                       AND to_regclass('public.backup_assets') IS NOT NULL
                     """
                 )
             )
@@ -591,6 +734,7 @@ class Database:
             "default_catalog",
             "index_message_enabled",
             "default_favorite",
+            "auto_manifest_enabled",
             "language",
         }
         if field not in allowed:
@@ -600,6 +744,39 @@ class Database:
                 WHERE us.user_id=u.id AND u.telegram_id=$1""",
             telegram_id,
             value,
+        )
+
+    async def user_usage(self, telegram_id: int) -> asyncpg.Record:
+        return await self.ready().fetchrow(
+            """SELECT count(f.id)::int AS records,
+                      COALESCE(sum(f.item_count),0)::int AS files,
+                      COALESCE(sum(f.file_size),0)::bigint AS total_size
+               FROM users u LEFT JOIN files f ON f.user_id=u.id AND f.deleted_at IS NULL
+               WHERE u.telegram_id=$1 GROUP BY u.id""",
+            telegram_id,
+        )
+
+    async def mark_manifest_dirty(self, telegram_id: int) -> None:
+        await self.ready().execute(
+            """UPDATE storage_channels s SET manifest_dirty_at=now() FROM users u
+               WHERE s.user_id=u.id AND u.telegram_id=$1""",
+            telegram_id,
+        )
+
+    async def find_duplicate(
+        self, telegram_id: int, unique_ids: list[str]
+    ) -> asyncpg.Record | None:
+        if not unique_ids:
+            return None
+        return await self.ready().fetchrow(
+            """SELECT f.id,f.title,f.code,fp.file_name
+               FROM file_parts fp JOIN files f ON f.id=fp.file_id
+               JOIN users u ON u.id=f.user_id
+               WHERE u.telegram_id=$1 AND f.deleted_at IS NULL
+                 AND fp.telegram_file_unique_id=ANY($2::text[])
+               ORDER BY f.created_at DESC LIMIT 1""",
+            telegram_id,
+            unique_ids,
         )
 
     async def unique_file_title(
@@ -629,6 +806,7 @@ class Database:
         telegram_id: int,
         title: str,
         parts: list[dict[str, Any]],
+        preferred_code: str | None = None,
     ) -> asyncpg.Record:
         if not parts:
             raise ValueError("Kamida bitta fayl qismi kerak")
@@ -652,7 +830,14 @@ class Database:
             total_size = sum(int(part["file_size"] or 0) for part in parts) or None
             first = parts[0]
             row: asyncpg.Record | None = None
-            for _ in range(12):
+            for attempt in range(12):
+                code = (
+                    preferred_code.upper()
+                    if attempt == 0
+                    and preferred_code
+                    and CODE_RE.fullmatch(preferred_code)
+                    else make_code()
+                )
                 row = await conn.fetchrow(
                     """INSERT INTO files(
                            user_id,channel_id,channel_message_id,code,title,file_type,
@@ -663,7 +848,7 @@ class Database:
                     context["user_id"],
                     context["channel_id"],
                     first["channel_message_id"],
-                    make_code(),
+                    code,
                     unique_title,
                     kinds[0] if len(kinds) == 1 else "collection",
                     context["catalog"],
@@ -697,6 +882,10 @@ class Database:
                     )
                     for position, part in enumerate(parts)
                 ],
+            )
+            await conn.execute(
+                "UPDATE storage_channels SET manifest_dirty_at=now() WHERE id=$1",
+                context["channel_id"],
             )
             return row
 
@@ -771,40 +960,37 @@ class Database:
         if CODE_RE.fullmatch(query):
             row = await self.file_by_code(telegram_id, query.upper())
             return [row] if row else []
-        if query.startswith("#"):
-            tag = normalize_tags(query)[0] if normalize_tags(query) else ""
-            return list(
-                await self.ready().fetch(
-                    """SELECT f.* FROM files f JOIN users u ON u.id=f.user_id
-                   WHERE u.telegram_id=$1 AND $2=ANY(f.tags) AND f.deleted_at IS NULL
-                   ORDER BY f.created_at DESC LIMIT $3""",
-                    telegram_id,
-                    tag,
-                    limit,
-                )
+        parsed = parse_search_query(query)
+        filters = ["u.telegram_id=$1", "f.deleted_at IS NULL"]
+        args: list[Any] = [telegram_id]
+
+        def add(value: Any) -> str:
+            args.append(value)
+            return f"${len(args)}"
+
+        if parsed["file_kind"]:
+            filters.append(f"{add(parsed['file_kind'])}=ANY(f.file_kinds)")
+        if parsed["date_start"]:
+            filters.append(f"f.created_at>={add(parsed['date_start'])}")
+            filters.append(f"f.created_at<{add(parsed['date_end'])}")
+        if parsed["catalog"]:
+            filters.append(f"f.catalog ILIKE {add(parsed['catalog'])}")
+        if parsed["tag"]:
+            filters.append(f"{add(parsed['tag'])}=ANY(f.tags)")
+        if parsed["text"]:
+            placeholder = add(parsed["text"])
+            filters.append(
+                f"""(lower(f.title) LIKE '%'||lower({placeholder})||'%' OR EXISTS(
+                    SELECT 1 FROM unnest(f.tags) t WHERE t ILIKE '%'||{placeholder}||'%')
+                    OR f.catalog ILIKE '%'||{placeholder}||'%')"""
             )
-        if query.lower().startswith("catalog:"):
-            catalog = query.split(":", 1)[1].strip()
-            return list(
-                await self.ready().fetch(
-                    """SELECT f.* FROM files f JOIN users u ON u.id=f.user_id
-                   WHERE u.telegram_id=$1 AND f.catalog ILIKE $2 AND f.deleted_at IS NULL
-                   ORDER BY f.created_at DESC LIMIT $3""",
-                    telegram_id,
-                    catalog,
-                    limit,
-                )
-            )
+        args.append(limit)
+        where = " AND ".join(filters)
         return list(
             await self.ready().fetch(
-                """SELECT f.* FROM files f JOIN users u ON u.id=f.user_id
-               WHERE u.telegram_id=$1 AND f.deleted_at IS NULL
-                 AND (f.title ILIKE '%'||$2||'%' OR EXISTS(
-                    SELECT 1 FROM unnest(f.tags) t WHERE t ILIKE '%'||$2||'%') OR f.catalog ILIKE '%'||$2||'%')
-               ORDER BY CASE WHEN lower(f.title)=lower($2) THEN 0 ELSE 1 END,f.created_at DESC LIMIT $3""",
-                telegram_id,
-                query,
-                limit,
+                f"""SELECT f.* FROM files f JOIN users u ON u.id=f.user_id
+                    WHERE {where} ORDER BY f.created_at DESC LIMIT ${len(args)}""",
+                *args,
             )
         )
 
@@ -835,12 +1021,17 @@ class Database:
                 unique_title = await self.unique_file_title(
                     conn, target["user_id"], str(value), parsed
                 )
-                return await conn.fetchrow(
+                row = await conn.fetchrow(
                     "UPDATE files SET title=$2,updated_at=now() WHERE id=$1 RETURNING *",
                     parsed,
                     unique_title,
                 )
-        return await self.ready().fetchrow(
+                await conn.execute(
+                    "UPDATE storage_channels SET manifest_dirty_at=now() WHERE user_id=$1",
+                    target["user_id"],
+                )
+                return row
+        row = await self.ready().fetchrow(
             f"""UPDATE files f SET {field}=$3,updated_at=now() FROM users u
                 WHERE f.user_id=u.id AND u.telegram_id=$1 AND f.id=$2 AND f.deleted_at IS NULL
                 RETURNING f.*""",
@@ -848,6 +1039,73 @@ class Database:
             parsed,
             value,
         )
+        if row:
+            await self.mark_manifest_dirty(telegram_id)
+        return row
+
+    async def replace_file_content(
+        self, telegram_id: int, file_id: str, parts: list[dict[str, Any]]
+    ) -> tuple[asyncpg.Record | None, list[int]]:
+        parsed = safe_uuid(file_id)
+        if not parsed or not parts:
+            return None, []
+        async with self.ready().acquire() as conn, conn.transaction():
+            target = await conn.fetchrow(
+                """SELECT f.*,
+                          COALESCE((SELECT array_agg(fp.channel_message_id ORDER BY fp.position)
+                                    FROM file_parts fp WHERE fp.file_id=f.id),
+                                   ARRAY[f.channel_message_id]) AS old_message_ids
+                   FROM files f JOIN users u ON u.id=f.user_id
+                   WHERE u.telegram_id=$1 AND f.id=$2 AND f.deleted_at IS NULL
+                   FOR UPDATE OF f""",
+                telegram_id,
+                parsed,
+            )
+            if not target:
+                return None, []
+            kinds = list(dict.fromkeys(str(part["file_kind"]) for part in parts))
+            total_size = sum(int(part["file_size"] or 0) for part in parts) or None
+            first = parts[0]
+            row = await conn.fetchrow(
+                """UPDATE files SET channel_message_id=$2,file_type=$3,
+                          telegram_file_unique_id=$4,file_size=$5,item_count=$6,
+                          file_kinds=$7,is_missing=false,updated_at=now()
+                   WHERE id=$1 RETURNING *""",
+                parsed,
+                first["channel_message_id"],
+                kinds[0] if len(kinds) == 1 else "collection",
+                first["file_unique_id"],
+                total_size,
+                len(parts),
+                kinds,
+            )
+            await conn.execute("DELETE FROM file_parts WHERE file_id=$1", parsed)
+            await conn.executemany(
+                """INSERT INTO file_parts(
+                       file_id,channel_message_id,position,content_type,file_kind,
+                       file_name,file_extension,mime_type,telegram_file_unique_id,file_size)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+                [
+                    (
+                        parsed,
+                        part["channel_message_id"],
+                        position,
+                        part["content_type"],
+                        part["file_kind"],
+                        part["file_name"],
+                        part["file_extension"],
+                        part["mime_type"],
+                        part["file_unique_id"],
+                        part["file_size"],
+                    )
+                    for position, part in enumerate(parts)
+                ],
+            )
+            await conn.execute(
+                "UPDATE storage_channels SET manifest_dirty_at=now() WHERE user_id=$1",
+                target["user_id"],
+            )
+            return row, list(target["old_message_ids"] or [])
 
     async def delete_file(self, telegram_id: int, file_id: str) -> bool:
         parsed = safe_uuid(file_id)
@@ -859,7 +1117,95 @@ class Database:
             telegram_id,
             parsed,
         )
+        if result.endswith("1"):
+            await self.mark_manifest_dirty(telegram_id)
         return result.endswith("1")
+
+    async def files_by_ids(
+        self, telegram_id: int, file_ids: list[str]
+    ) -> list[asyncpg.Record]:
+        parsed = [value for item in file_ids if (value := safe_uuid(item))]
+        if not parsed:
+            return []
+        return list(
+            await self.ready().fetch(
+                """SELECT f.*,s.telegram_channel_id,
+                          COALESCE((SELECT array_agg(fp.channel_message_id ORDER BY fp.position)
+                                    FROM file_parts fp WHERE fp.file_id=f.id),
+                                   ARRAY[f.channel_message_id]) AS channel_message_ids
+                   FROM files f JOIN users u ON u.id=f.user_id
+                   JOIN storage_channels s ON s.id=f.channel_id
+                   WHERE u.telegram_id=$1 AND f.id=ANY($2::uuid[])
+                     AND f.deleted_at IS NULL ORDER BY f.created_at DESC""",
+                telegram_id,
+                parsed,
+            )
+        )
+
+    async def bulk_add_tags(
+        self, telegram_id: int, file_ids: list[str], tags: list[str]
+    ) -> int:
+        parsed = [value for item in file_ids if (value := safe_uuid(item))]
+        if not parsed or not tags:
+            return 0
+        rows = await self.ready().fetch(
+            """UPDATE files f SET tags=(
+                     SELECT array_agg(tag ORDER BY first_seen) FROM (
+                       SELECT tag,min(position) AS first_seen
+                       FROM unnest(f.tags || $3::text[]) WITH ORDINALITY AS value(tag,position)
+                       GROUP BY tag ORDER BY first_seen LIMIT 10
+                     ) selected_tags
+                   ),updated_at=now()
+               FROM users u WHERE f.user_id=u.id AND u.telegram_id=$1
+                 AND f.id=ANY($2::uuid[]) AND f.deleted_at IS NULL RETURNING f.id""",
+            telegram_id,
+            parsed,
+            tags,
+        )
+        if rows:
+            await self.mark_manifest_dirty(telegram_id)
+        return len(rows)
+
+    async def bulk_set_catalog(
+        self, telegram_id: int, file_ids: list[str], catalog: str
+    ) -> int:
+        parsed = [value for item in file_ids if (value := safe_uuid(item))]
+        if not parsed:
+            return 0
+        valid = await self.ready().fetchval(
+            """SELECT $2='Umumiy' OR EXISTS(
+                   SELECT 1 FROM catalogs c JOIN users u ON u.id=c.user_id
+                   WHERE u.telegram_id=$1 AND c.name=$2)""",
+            telegram_id,
+            catalog,
+        )
+        if not valid:
+            return 0
+        rows = await self.ready().fetch(
+            """UPDATE files f SET catalog=$3,updated_at=now() FROM users u
+               WHERE f.user_id=u.id AND u.telegram_id=$1 AND f.id=ANY($2::uuid[])
+                 AND f.deleted_at IS NULL RETURNING f.id""",
+            telegram_id,
+            parsed,
+            catalog,
+        )
+        if rows:
+            await self.mark_manifest_dirty(telegram_id)
+        return len(rows)
+
+    async def bulk_delete_files(self, telegram_id: int, file_ids: list[str]) -> int:
+        parsed = [value for item in file_ids if (value := safe_uuid(item))]
+        if not parsed:
+            return 0
+        rows = await self.ready().fetch(
+            """DELETE FROM files f USING users u WHERE f.user_id=u.id
+               AND u.telegram_id=$1 AND f.id=ANY($2::uuid[]) RETURNING f.id""",
+            telegram_id,
+            parsed,
+        )
+        if rows:
+            await self.mark_manifest_dirty(telegram_id)
+        return len(rows)
 
     async def catalogs(self, telegram_id: int) -> list[asyncpg.Record]:
         return list(
@@ -935,11 +1281,311 @@ class Database:
             "files": jsonable(files),
         }
 
+    async def export_manifest(self, telegram_id: int) -> dict[str, Any] | None:
+        channel = await self.storage_by_tg(telegram_id)
+        if not channel:
+            return None
+        files = await self.ready().fetch(
+            """SELECT f.id,f.code,f.title,f.file_type,f.file_kinds,f.item_count,
+                      f.catalog,f.tags,f.is_favorite,f.file_size,f.created_at,
+                      COALESCE(jsonb_agg(jsonb_build_object(
+                        'channel_message_id',fp.channel_message_id,
+                        'position',fp.position,'content_type',fp.content_type,
+                        'file_kind',fp.file_kind,'file_name',fp.file_name,
+                        'file_extension',fp.file_extension,'mime_type',fp.mime_type,
+                        'file_unique_id',fp.telegram_file_unique_id,
+                        'file_size',fp.file_size
+                      ) ORDER BY fp.position) FILTER (WHERE fp.id IS NOT NULL),'[]'::jsonb) AS parts
+               FROM files f JOIN users u ON u.id=f.user_id
+               LEFT JOIN file_parts fp ON fp.file_id=f.id
+               WHERE u.telegram_id=$1 AND f.deleted_at IS NULL
+               GROUP BY f.id ORDER BY f.created_at""",
+            telegram_id,
+        )
+        return {
+            "owner_telegram_id": telegram_id,
+            "telegram_channel_id": channel["telegram_channel_id"],
+            "channel_title": channel["channel_title"],
+            "files": jsonable(files),
+        }
+
+    async def pending_manifest_users(self, limit: int = 3) -> list[asyncpg.Record]:
+        return list(
+            await self.ready().fetch(
+                """SELECT u.telegram_id,s.telegram_channel_id,s.manifest_message_id
+                   FROM storage_channels s JOIN users u ON u.id=s.user_id
+                   JOIN user_settings us ON us.user_id=u.id
+                   WHERE s.is_active AND us.auto_manifest_enabled
+                     AND s.manifest_dirty_at IS NOT NULL
+                     AND s.manifest_dirty_at < now()-interval '30 seconds'
+                   ORDER BY s.manifest_dirty_at LIMIT $1""",
+                limit,
+            )
+        )
+
+    async def complete_manifest_backup(
+        self, telegram_id: int, message_id: int
+    ) -> int | None:
+        async with self.ready().acquire() as conn, conn.transaction():
+            old_message_id = await conn.fetchval(
+                """SELECT s.manifest_message_id FROM storage_channels s
+                   JOIN users u ON u.id=s.user_id WHERE u.telegram_id=$1
+                   FOR UPDATE OF s""",
+                telegram_id,
+            )
+            await conn.execute(
+                """UPDATE storage_channels s SET manifest_message_id=$2,
+                          manifest_dirty_at=NULL,manifest_updated_at=now()
+                   FROM users u WHERE s.user_id=u.id AND u.telegram_id=$1""",
+                telegram_id,
+                message_id,
+            )
+            return int(old_message_id) if old_message_id else None
+
+    async def restore_manifest_files(
+        self, telegram_id: int, payload: dict[str, Any]
+    ) -> tuple[int, int]:
+        storage = await self.storage_by_tg(telegram_id)
+        if not storage or int(payload.get("telegram_channel_id", 0)) != int(
+            storage["telegram_channel_id"]
+        ):
+            raise ValueError("Manifest boshqa storage kanalga tegishli")
+        restored = 0
+        skipped = 0
+        for saved in list(payload.get("files") or [])[:1000]:
+            raw_parts = list(saved.get("parts") or [])[:100]
+            parts: list[dict[str, Any]] = []
+            for raw in raw_parts:
+                try:
+                    channel_message_id = int(raw["channel_message_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                parts.append(
+                    {
+                        "channel_message_id": channel_message_id,
+                        "content_type": str(raw.get("content_type") or "document")[:32],
+                        "file_kind": str(raw.get("file_kind") or "other")[:32],
+                        "file_name": clean_title(raw.get("file_name"), "") or None,
+                        "file_extension": str(raw.get("file_extension") or "")[:16]
+                        or None,
+                        "mime_type": str(raw.get("mime_type") or "")[:100] or None,
+                        "file_unique_id": str(raw.get("file_unique_id") or "")[:200]
+                        or None,
+                        "file_size": max(0, int(raw.get("file_size") or 0)) or None,
+                    }
+                )
+            if not parts:
+                skipped += 1
+                continue
+            exists = await self.ready().fetchval(
+                """SELECT EXISTS(SELECT 1 FROM files f
+                   JOIN users u ON u.id=f.user_id
+                   WHERE u.telegram_id=$1 AND f.channel_message_id=$2)""",
+                telegram_id,
+                parts[0]["channel_message_id"],
+            )
+            if exists:
+                skipped += 1
+                continue
+            try:
+                row = await self.create_file(
+                    telegram_id,
+                    clean_title(saved.get("title"), "Tiklangan fayl"),
+                    parts,
+                    preferred_code=str(saved.get("code") or ""),
+                )
+                tags = normalize_tags(" ".join(str(tag) for tag in saved.get("tags", [])))
+                catalog = clean_title(saved.get("catalog"), "Umumiy")[:16]
+                if catalog.casefold() != "umumiy":
+                    await self.add_catalog(telegram_id, catalog)
+                await self.ready().execute(
+                    """UPDATE files SET tags=$2,catalog=$3,is_favorite=$4
+                       WHERE id=$1""",
+                    row["id"],
+                    tags,
+                    catalog,
+                    bool(saved.get("is_favorite")),
+                )
+                restored += 1
+            except (asyncpg.PostgresError, PermissionError, RuntimeError, ValueError):
+                skipped += 1
+        return restored, skipped
+
     async def delete_user(self, telegram_id: int) -> bool:
         result = await self.ready().execute(
             "DELETE FROM users WHERE telegram_id=$1", telegram_id
         )
         return result.endswith("1")
+
+    async def super_backup_config(self) -> asyncpg.Record:
+        return await self.ready().fetchrow(
+            "SELECT * FROM app_settings WHERE singleton=true"
+        )
+
+    async def set_super_backup_config(
+        self, enabled: bool, channel_id: int | None
+    ) -> asyncpg.Record:
+        return await self.ready().fetchrow(
+            """UPDATE app_settings SET super_backup_enabled=$1,
+                      super_backup_channel_id=$2,updated_at=now()
+               WHERE singleton=true RETURNING *""",
+            enabled,
+            channel_id,
+        )
+
+    async def enqueue_super_backup(
+        self, telegram_id: int, file_id: UUID | str
+    ) -> asyncpg.Record | None:
+        parsed = safe_uuid(file_id)
+        if not parsed:
+            return None
+        return await self.ready().fetchrow(
+            """INSERT INTO backup_assets(
+                   file_id,owner_telegram_id,owner_name,owner_username,
+                   version,status,title,code,file_kinds,item_count,
+                   source_channel_id,source_channel_title,source_message_ids)
+               SELECT f.id,u.telegram_id,COALESCE(u.display_name,u.first_name),u.username,
+                      COALESCE((SELECT max(version)+1 FROM backup_assets WHERE file_id=f.id),1),
+                      'pending',f.title,f.code,f.file_kinds,f.item_count,
+                      s.telegram_channel_id,s.channel_title,
+                      COALESCE((SELECT array_agg(fp.channel_message_id ORDER BY fp.position)
+                                FROM file_parts fp WHERE fp.file_id=f.id),ARRAY[f.channel_message_id])
+               FROM files f JOIN users u ON u.id=f.user_id
+               JOIN storage_channels s ON s.id=f.channel_id
+               WHERE f.id=$1 AND u.telegram_id=$2
+               ON CONFLICT (file_id,version) DO NOTHING RETURNING *""",
+            parsed,
+            telegram_id,
+        )
+
+    async def enqueue_existing_owner_backups(
+        self, telegram_ids: list[int], target_channel_id: int
+    ) -> int:
+        if not telegram_ids:
+            return 0
+        rows = await self.ready().fetch(
+            """INSERT INTO backup_assets(
+                   file_id,owner_telegram_id,owner_name,owner_username,
+                   version,status,title,code,file_kinds,item_count,
+                   source_channel_id,source_channel_title,source_message_ids)
+               SELECT f.id,u.telegram_id,COALESCE(u.display_name,u.first_name),u.username,
+                      COALESCE((SELECT max(bv.version)+1 FROM backup_assets bv
+                                WHERE bv.file_id=f.id),1),
+                      'pending',f.title,f.code,f.file_kinds,f.item_count,
+                      s.telegram_channel_id,s.channel_title,
+                      COALESCE((SELECT array_agg(fp.channel_message_id ORDER BY fp.position)
+                                FROM file_parts fp WHERE fp.file_id=f.id),ARRAY[f.channel_message_id])
+               FROM files f JOIN users u ON u.id=f.user_id
+               JOIN storage_channels s ON s.id=f.channel_id
+               WHERE u.telegram_id=ANY($1::bigint[]) AND f.deleted_at IS NULL
+                 AND NOT EXISTS(
+                   SELECT 1 FROM backup_assets existing WHERE existing.file_id=f.id
+                     AND (existing.status IN ('pending','processing') OR
+                          (existing.status='active' AND existing.backup_channel_id=$2))
+                 )
+               ON CONFLICT (file_id,version) DO NOTHING
+               RETURNING id""",
+            telegram_ids,
+            target_channel_id,
+        )
+        return len(rows)
+
+    async def pending_super_backups(self, limit: int = 5) -> list[asyncpg.Record]:
+        return list(
+            await self.ready().fetch(
+                """SELECT b.*,a.super_backup_channel_id FROM backup_assets b
+                   CROSS JOIN app_settings a WHERE a.singleton=true
+                     AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
+                     AND b.status='pending' ORDER BY b.created_at LIMIT $1""",
+                limit,
+            )
+        )
+
+    async def latest_super_backup_for_file(
+        self, telegram_id: int, file_id: UUID | str
+    ) -> asyncpg.Record | None:
+        parsed = safe_uuid(file_id)
+        if not parsed:
+            return None
+        return await self.ready().fetchrow(
+            """SELECT * FROM backup_assets
+               WHERE file_id=$1 AND owner_telegram_id=$2
+               ORDER BY version DESC LIMIT 1""",
+            parsed,
+            telegram_id,
+        )
+
+    async def claim_super_backup(self, backup_id: UUID) -> asyncpg.Record | None:
+        return await self.ready().fetchrow(
+            """UPDATE backup_assets b SET status='processing',updated_at=now()
+               FROM app_settings a
+               WHERE b.id=$1 AND b.status='pending' AND a.singleton=true
+                 AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
+               RETURNING b.*,a.super_backup_channel_id""",
+            backup_id,
+        )
+
+    async def requeue_stale_super_backups(self) -> None:
+        await self.ready().execute(
+            """UPDATE backup_assets SET status='pending',updated_at=now(),
+                      error_message='stale processing lease retried'
+               WHERE status='processing' AND updated_at < now()-interval '5 minutes'"""
+        )
+
+    async def complete_super_backup(
+        self,
+        backup_id: UUID,
+        channel_id: int,
+        message_ids: list[int],
+        index_message_id: int,
+    ) -> None:
+        await self.ready().execute(
+            """UPDATE backup_assets SET status='active',backup_channel_id=$2,
+                      backup_message_ids=$3,index_message_id=$4,error_message=NULL,
+                      updated_at=now() WHERE id=$1""",
+            backup_id,
+            channel_id,
+            message_ids,
+            index_message_id,
+        )
+
+    async def fail_super_backup(self, backup_id: UUID, error: str) -> None:
+        await self.ready().execute(
+            """UPDATE backup_assets SET status='failed',error_message=$2,
+                      updated_at=now() WHERE id=$1""",
+            backup_id,
+            error[:300],
+        )
+
+    async def retry_super_backup(self, backup_id: UUID) -> bool:
+        result = await self.ready().execute(
+            """UPDATE backup_assets SET status='pending',error_message=NULL,
+                      updated_at=now() WHERE id=$1 AND status='failed'""",
+            backup_id,
+        )
+        return result.endswith("1")
+
+    async def set_super_backup_status(
+        self, telegram_id: int, file_id: UUID | str, new_status: str
+    ) -> list[asyncpg.Record]:
+        parsed = safe_uuid(file_id)
+        if not parsed or new_status not in {"deleted", "replaced", "missing"}:
+            return []
+        return list(
+            await self.ready().fetch(
+                """UPDATE backup_assets SET status=$3,updated_at=now()
+                   WHERE file_id=$2 AND owner_telegram_id=$1 AND status='active'
+                   RETURNING *""",
+                telegram_id,
+                parsed,
+                new_status,
+            )
+        )
+
+    async def backup_asset(self, backup_id: UUID) -> asyncpg.Record | None:
+        return await self.ready().fetchrow(
+            "SELECT * FROM backup_assets WHERE id=$1", backup_id
+        )
 
     async def audit(
         self,
@@ -968,7 +1614,35 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 router = Router(name="keepgram")
-dp = Dispatcher(storage=MemoryStorage())
+redis_client = (
+    Redis.from_url(
+        settings.redis_url.get_secret_value(),
+        encoding="utf-8",
+        decode_responses=True,
+        socket_connect_timeout=3,
+        socket_timeout=5,
+        health_check_interval=30,
+    )
+    if settings.redis_url
+    else None
+)
+
+
+async def redis_healthy() -> bool | None:
+    if not redis_client:
+        return None
+    try:
+        return bool(await redis_client.ping())
+    except Exception:  # noqa: BLE001 - health endpoint must return a status, not crash
+        return False
+
+
+fsm_storage = (
+    RedisStorage(redis_client, state_ttl=86_400, data_ttl=86_400)
+    if redis_client
+    else MemoryStorage()
+)
+dp = Dispatcher(storage=fsm_storage)
 dp.include_router(router)
 
 
@@ -979,6 +1653,9 @@ class Flow(StatesGroup):
     tags = State()
     catalog_name = State()
     save_text = State()
+    bulk_tags = State()
+    replace_file = State()
+    restore_manifest = State()
     delete_account = State()
 
 
@@ -1031,8 +1708,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="📚 Barcha saqlanganlar")],
         [KeyboardButton(text="🗂 Kataloglar"), KeyboardButton(text="🏷 Teglar")],
         [KeyboardButton(text="🔢 Kod bo‘yicha"), KeyboardButton(text="🕘 Oxirgilari")],
-        [KeyboardButton(text="⭐ Sevimlilar"), KeyboardButton(text="⚙️ Sozlamalar")],
-        [KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="⭐ Sevimlilar"), KeyboardButton(text="📊 Statistika")],
+        [KeyboardButton(text="⚙️ Sozlamalar"), KeyboardButton(text="ℹ️ Yordam")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Fayl, kod yoki qidiruv matnini yuboring",
@@ -1096,12 +1773,30 @@ def kinds_text(kinds: list[str]) -> str:
     return ", ".join(file_kind_label(kind) for kind in kinds) or "Boshqa fayl"
 
 
+def human_size(value: int) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def configured_admin_telegram_ids() -> set[int]:
+    return {
+        int(item.strip())
+        for item in settings.admin_telegram_ids.split(",")
+        if item.strip().isdigit()
+    }
+
+
 def file_actions(file_id: Any, favorite: bool = False) -> InlineKeyboardMarkup:
     fid = str(file_id)
     return ikb(
         [
-            [("📤 Olish", f"f:get:{fid}"), ("✏️ Nom", f"f:ren:{fid}")],
-            [("🏷 Teglar", f"f:tag:{fid}"), ("🗂 Katalog", f"f:cat:{fid}")],
+            [("📤 Olish", f"f:get:{fid}"), ("♻️ Almashtirish", f"f:replace:{fid}")],
+            [("✏️ Nom", f"f:ren:{fid}"), ("🏷 Teglar", f"f:tag:{fid}")],
+            [("🗂 Katalog", f"f:cat:{fid}")],
             [
                 ("☆ Sevimlidan" if favorite else "⭐ Sevimli", f"f:fav:{fid}"),
                 ("🗑 O‘chirish", f"f:del:{fid}"),
@@ -1228,12 +1923,52 @@ async def show_inventory(
         navigation.append(("Keyingi ➡️", f"inventory:{page + 1}"))
     if navigation:
         buttons.append(navigation)
+    buttons.append([("☑️ Bir nechtasini tanlash", f"bulk:start:{page}")])
     text = inventory_page_text(rows, total, page, pages)
     markup = ikb(buttons)
     if edit:
         await message.edit_text(text, reply_markup=markup)
     else:
         await message.answer(text, reply_markup=markup)
+
+
+async def show_bulk_inventory(
+    message: Message, telegram_id: int, state: FSMContext, page: int
+) -> None:
+    rows, total = await db.files_page(telegram_id, page=page, limit=INVENTORY_PAGE_SIZE)
+    if not rows:
+        await message.edit_text("📭 Tanlash uchun yozuv yo‘q.")
+        return
+    data = await state.get_data()
+    selected = set(data.get("bulk_selected", []))
+    pages = max(1, (total + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
+    buttons = [
+        [
+            (
+                f"{'✅' if str(row['id']) in selected else '⬜'} {str(row['title'])[:30]}",
+                f"bulk:toggle:{page}:{row['id']}",
+            )
+        ]
+        for row in rows
+    ]
+    navigation: list[tuple[str, str]] = []
+    if page > 1:
+        navigation.append(("⬅️", f"bulk:page:{page - 1}"))
+    navigation.append((f"{page}/{pages}", "noop"))
+    if page < pages:
+        navigation.append(("➡️", f"bulk:page:{page + 1}"))
+    buttons.extend(
+        [
+            navigation,
+            [("🏷 Teg qo‘shish", "bulk:tags"), ("🗂 Katalog", "bulk:catalog")],
+            [("🗑 Ommaviy o‘chirish", "bulk:delete"), ("✅ Tugatish", "bulk:done")],
+        ]
+    )
+    await message.edit_text(
+        f"☑️ <b>Ommaviy boshqaruv</b> · {len(selected)} ta tanlandi\n"
+        "Yozuvlarni belgilang, so‘ng amalni tanlang.",
+        reply_markup=ikb(buttons),
+    )
 
 
 async def send_stored_file(chat_id: int, row: asyncpg.Record) -> bool:
@@ -1254,6 +1989,7 @@ async def send_stored_file(chat_id: int, row: asyncpg.Record) -> bool:
         return True
     except (TelegramBadRequest, TelegramForbiddenError):
         await db.update_file(chat_id, str(row["id"]), "is_missing", True)
+        await update_super_backup_status(chat_id, row["id"], "missing")
         await bot.send_message(
             chat_id,
             "⚠️ Fayl storage kanaldan o‘chirilgan yoki bot kanalga kira olmayapti.",
@@ -1285,6 +2021,39 @@ async def save_messages(messages: list[Message]) -> None:
         )
         return
     parts = [content_metadata(item) for item in messages]
+    unique_ids = [str(part["file_unique_id"]) for part in parts if part["file_unique_id"]]
+    if len(unique_ids) != len(set(unique_ids)):
+        await message.answer(
+            "⚠️ Yuborilgan to‘plam ichida bir xil fayl takrorlangan. Dublikatni olib tashlab qayta yuboring."
+        )
+        return
+    duplicate = await db.find_duplicate(message.from_user.id, unique_ids)
+    if duplicate:
+        await message.answer(
+            "♻️ Bu fayl avval saqlangan.\n\n"
+            f"📝 {esc(duplicate['title'])}\n🔢 Kod: <code>{duplicate['code']}</code>",
+            reply_markup=ikb(
+                [[("📂 Avvalgi yozuvni ochish", f"f:open:{duplicate['id']}")]]
+            ),
+        )
+        return
+    usage = await db.user_usage(message.from_user.id)
+    current_files = int(usage["files"] if usage else 0)
+    current_size = int(usage["total_size"] if usage else 0)
+    incoming_size = sum(int(part["file_size"] or 0) for part in parts)
+    size_limit = settings.max_total_size_mb * 1024 * 1024
+    if current_files + len(parts) > settings.max_files_per_user:
+        await message.answer(
+            f"⚠️ Fayllar limiti tugagan: {current_files}/{settings.max_files_per_user}. "
+            "Keraksiz yozuvlarni o‘chirib, qayta urinib ko‘ring."
+        )
+        return
+    if current_size + incoming_size > size_limit:
+        await message.answer(
+            f"⚠️ Umumiy hajm limiti tugagan: {settings.max_total_size_mb} MB. "
+            "Keraksiz yozuvlarni o‘chirib, qayta urinib ko‘ring."
+        )
+        return
     title = collection_title(messages, parts)
     copied_ids: list[int] = []
     try:
@@ -1341,6 +2110,12 @@ async def save_messages(messages: list[Message]) -> None:
             "⚠️ Indeksni yaratib bo‘lmadi. Operatsiya bekor qilindi; qayta urinib ko‘ring."
         )
         return
+    if await super_backup_allowed(message.from_user.id):
+        backup_config = await db.super_backup_config()
+        if backup_config["super_backup_enabled"] and backup_config[
+            "super_backup_channel_id"
+        ]:
+            await db.enqueue_super_backup(message.from_user.id, row["id"])
     if storage["index_message_enabled"]:
         tags = " ".join(f"#T_{tag}" for tag in row["tags"])
         type_summary = kinds_text(row_file_kinds(row))
@@ -1361,10 +2136,12 @@ async def save_messages(messages: list[Message]) -> None:
     )
 
 
-MEDIA_GROUP_SETTLE_SECONDS = 1.2
+MEDIA_GROUP_SETTLE_SECONDS = 2.0
+REDIS_ALBUM_QUEUE = "keepgram:albums:due"
 album_buffers: dict[tuple[int, str], list[Message]] = {}
 album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
 album_lock = asyncio.Lock()
+redis_album_worker_task: asyncio.Task[None] | None = None
 
 
 async def flush_media_group(key: tuple[int, str]) -> None:
@@ -1391,6 +2168,23 @@ async def flush_media_group(key: tuple[int, str]) -> None:
 
 
 async def queue_media_group(message: Message) -> None:
+    if redis_client:
+        album_key = (
+            f"keepgram:album:{message.from_user.id}:{str(message.media_group_id)}"
+        )
+        async with redis_client.pipeline(transaction=True) as pipe:
+            pipe.hset(
+                album_key,
+                str(message.message_id),
+                message.model_dump_json(exclude_none=True),
+            )
+            pipe.expire(album_key, 900)
+            pipe.zadd(
+                REDIS_ALBUM_QUEUE,
+                {album_key: time.time() + MEDIA_GROUP_SETTLE_SECONDS},
+            )
+            await pipe.execute()
+        return
     key = (message.from_user.id, str(message.media_group_id))
     async with album_lock:
         buffered = album_buffers.setdefault(key, [])
@@ -1400,6 +2194,50 @@ async def queue_media_group(message: Message) -> None:
         if previous:
             previous.cancel()
         album_tasks[key] = asyncio.create_task(flush_media_group(key))
+
+
+async def redis_album_worker() -> None:
+    if not redis_client:
+        return
+    while True:
+        try:
+            due_keys = await redis_client.zrangebyscore(
+                REDIS_ALBUM_QUEUE, min="-inf", max=time.time(), start=0, num=10
+            )
+            for album_key in due_keys:
+                lock_key = f"{album_key}:lock"
+                lock_token = secrets.token_urlsafe(16)
+                acquired = await redis_client.set(lock_key, lock_token, nx=True, ex=60)
+                if not acquired:
+                    continue
+                try:
+                    score = await redis_client.zscore(REDIS_ALBUM_QUEUE, album_key)
+                    if score is None or float(score) > time.time():
+                        continue
+                    serialized = list((await redis_client.hgetall(album_key)).values())
+                    messages = [
+                        Message.model_validate_json(item, context={"bot": bot})
+                        for item in serialized
+                    ]
+                    if messages:
+                        await save_messages(messages)
+                    async with redis_client.pipeline(transaction=True) as pipe:
+                        pipe.delete(album_key)
+                        pipe.zrem(REDIS_ALBUM_QUEUE, album_key)
+                        await pipe.execute()
+                finally:
+                    await redis_client.eval(
+                        "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end",
+                        1,
+                        lock_key,
+                        lock_token,
+                    )
+            await asyncio.sleep(0.4)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Redis album worker iteration failed")
+            await asyncio.sleep(2)
 
 
 async def save_message(message: Message) -> None:
@@ -1501,6 +2339,7 @@ async def cmd_help(message: Message) -> None:
         "3. Bot bergan 6 belgili kodni saqlab qo‘ying.\n"
         "4. Kodni yuboring yoki 🔎 Qidirish orqali faylni toping.\n\n"
         "/recent — oxirgilari\n/all — barcha saqlanganlar menyusi\n/catalogs — kataloglar\n/tags — teglar\n/settings — sozlamalar\n"
+        "/stats — fayllar soni va hajmi\n/backup — tiklash manifesti\n/restore — manifestni tiklash\n"
         "/mydata — saqlangan metadata\n/delete_my_data — metadata hisobini o‘chirish\n/privacy — maxfiylik\n/cancel — amalni bekor qilish"
     )
 
@@ -1513,7 +2352,9 @@ async def cmd_privacy(message: Message) -> None:
         "🔐 <b>Maxfiylik</b>\n\nFayllar KeepGram serverida saqlanmaydi; ular siz ulagan Telegram kanalida qoladi. "
         "Bazaga faqat nom, kod, katalog, teg, kanal ID va xabar ID kabi indeks metadata yoziladi. "
         "Ism va telefon raqami ro‘yxatdan o‘tish uchun majburiy; telefon faqat o‘zingiz Telegram kontakt tugmasi orqali tasdiqlaganingizda saqlanadi. "
-        "Admin panel real faylni ko‘rsatmaydi. Kanal va Telegram hisobingiz xavfsizligi sizning nazoratingizda."
+        "ADMIN_TELEGRAM_IDS ichidagi bot egasiga tegishli fayllar, egasi admin panelda owner-backup kanalini yoqqan bo‘lsa, "
+        "Telegram ichidagi alohida avariya kanaliga ham nusxalanadi; oddiy foydalanuvchilar fayli bu kanalga olinmaydi. "
+        "Kanal va Telegram hisobingiz xavfsizligi sizning nazoratingizda."
     )
 
 
@@ -1534,7 +2375,8 @@ async def info_privacy(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     await callback.message.answer(
-        "Fayl baytlari yuklab olinmaydi; faqat Telegram <code>copyMessage</code> amali va kichik metadata indeksi ishlatiladi."
+        "Fayl baytlari Render’ga yuklab olinmaydi; Telegram <code>copyMessage</code> amali va kichik metadata indeksi ishlatiladi. "
+        "Bot egasi ADMIN_TELEGRAM_IDS ro‘yxatida bo‘lsa, admin panelda yoqilgan owner-backup ham faqat uning o‘z fayllariga tatbiq etiladi."
     )
 
 
@@ -1748,6 +2590,153 @@ async def save_text_state(message: Message, state: FSMContext) -> None:
 
 
 @router.message(
+    Flow.restore_manifest,
+    F.document,
+    F.chat.type == ChatType.PRIVATE,
+)
+async def restore_manifest_finish(message: Message, state: FSMContext) -> None:
+    if not await actor_user(message):
+        return
+    if (message.document.file_size or 0) > 2 * 1024 * 1024:
+        await message.answer("⚠️ Manifest 2 MB dan katta bo‘lmasligi kerak.")
+        return
+    if not (message.document.file_name or "").lower().endswith(".json"):
+        await message.answer("⚠️ KeepGram yaratgan JSON manifest faylini yuboring.")
+        return
+    destination = io.BytesIO()
+    try:
+        await bot.download(message.document, destination=destination)
+        payload = verify_manifest_bytes(destination.getvalue(), message.from_user.id)
+        incoming_files = sum(
+            len(saved.get("parts") or []) for saved in payload.get("files", [])[:1000]
+        )
+        incoming_size = sum(
+            int(part.get("file_size") or 0)
+            for saved in payload.get("files", [])[:1000]
+            for part in (saved.get("parts") or [])[:100]
+        )
+        usage = await db.user_usage(message.from_user.id)
+        if int(usage["files"] if usage else 0) + incoming_files > settings.max_files_per_user:
+            raise ValueError("Manifest tiklanganda fayllar limiti oshib ketadi")
+        if (
+            int(usage["total_size"] if usage else 0) + incoming_size
+            > settings.max_total_size_mb * 1024 * 1024
+        ):
+            raise ValueError("Manifest tiklanganda umumiy hajm limiti oshib ketadi")
+        restored, skipped = await db.restore_manifest_files(
+            message.from_user.id, payload
+        )
+    except ValueError as exc:
+        await message.answer(f"⚠️ {esc(exc)}")
+        return
+    except Exception:
+        log.exception("Manifest restore failed")
+        await message.answer("⚠️ Manifestni tiklab bo‘lmadi.")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Manifest tiklandi: {restored} ta yozuv qo‘shildi, {skipped} ta mavjud yoki yaroqsiz yozuv o‘tkazib yuborildi."
+    )
+
+
+@router.message(
+    Flow.replace_file,
+    F.chat.type == ChatType.PRIVATE,
+    F.content_type.in_(
+        {
+            "document",
+            "photo",
+            "video",
+            "audio",
+            "voice",
+            "animation",
+            "sticker",
+            "video_note",
+        }
+    ),
+)
+async def replace_file_finish(message: Message, state: FSMContext) -> None:
+    if not await actor_user(message):
+        return
+    if message.media_group_id:
+        await message.answer(
+            "⚠️ Almashtirishda hozircha faqat bitta yangi fayl yuboring. /cancel — bekor qilish."
+        )
+        return
+    data = await state.get_data()
+    target = await db.file_by_id(message.from_user.id, data.get("replace_file_id", ""))
+    if not target:
+        await state.clear()
+        await message.answer("Almashtiriladigan yozuv topilmadi.")
+        return
+    part = content_metadata(message)
+    unique_id = str(part["file_unique_id"] or "")
+    duplicate = await db.find_duplicate(
+        message.from_user.id, [unique_id] if unique_id else []
+    )
+    if duplicate and str(duplicate["id"]) != str(target["id"]):
+        await message.answer(
+            f"♻️ Bu fayl boshqa yozuvda mavjud: <b>{esc(duplicate['title'])}</b> · "
+            f"<code>{duplicate['code']}</code>"
+        )
+        return
+    usage = await db.user_usage(message.from_user.id)
+    new_total = (
+        int(usage["total_size"] if usage else 0)
+        - int(target["file_size"] or 0)
+        + int(part["file_size"] or 0)
+    )
+    if new_total > settings.max_total_size_mb * 1024 * 1024:
+        await message.answer("⚠️ Yangi fayl umumiy hajm limitidan oshib ketadi.")
+        return
+    storage = await db.storage_by_tg(message.from_user.id)
+    if not storage or not storage["is_active"]:
+        await message.answer("⚠️ Storage kanal faol emas. /channel orqali tekshiring.")
+        return
+    try:
+        copied = await bot.copy_message(
+            chat_id=storage["telegram_channel_id"],
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except (TelegramBadRequest, TelegramForbiddenError):
+        await db.mark_channel_inactive(message.from_user.id)
+        await message.answer("⚠️ Yangi faylni storage kanalga nusxalab bo‘lmadi.")
+        return
+    part["channel_message_id"] = copied.message_id
+    try:
+        updated, old_message_ids = await db.replace_file_content(
+            message.from_user.id, str(target["id"]), [part]
+        )
+    except Exception:
+        log.exception("File replacement failed")
+        try:
+            await bot.delete_message(storage["telegram_channel_id"], copied.message_id)
+        except Exception:  # noqa: BLE001 - replacement rollback is best effort
+            log.warning("Replacement rollback failed")
+        await message.answer("⚠️ Faylni almashtirib bo‘lmadi. Qayta urinib ko‘ring.")
+        return
+    await update_super_backup_status(message.from_user.id, target["id"], "replaced")
+    if await super_backup_allowed(message.from_user.id):
+        backup_config = await db.super_backup_config()
+        if backup_config["super_backup_enabled"] and backup_config[
+            "super_backup_channel_id"
+        ]:
+            await db.enqueue_super_backup(message.from_user.id, updated["id"])
+            await flush_pending_super_backup(message.from_user.id, updated["id"])
+    for old_message_id in old_message_ids:
+        try:
+            await bot.delete_message(storage["telegram_channel_id"], old_message_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            log.warning("Old replaced message could not be removed: %s", old_message_id)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>{esc(updated['title'])}</b> faylining tarkibi almashtirildi. "
+        f"Kod o‘zgarmadi: <code>{updated['code']}</code>"
+    )
+
+
+@router.message(
     F.chat.type == ChatType.PRIVATE,
     F.content_type.in_(
         {
@@ -1844,11 +2833,191 @@ async def inventory_callback(callback: CallbackQuery) -> None:
     await show_inventory(callback.message, callback.from_user.id, page, edit=True)
 
 
+@router.callback_query(F.data.startswith("bulk:start:"))
+@router.callback_query(F.data.startswith("bulk:page:"))
+async def bulk_start_or_page(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback):
+        return
+    page = max(1, int(callback.data.rsplit(":", 1)[1]))
+    if callback.data.startswith("bulk:start:"):
+        await state.update_data(bulk_selected=[])
+    await callback.answer()
+    await show_bulk_inventory(callback.message, callback.from_user.id, state, page)
+
+
+@router.callback_query(F.data.startswith("bulk:toggle:"))
+async def bulk_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback):
+        return
+    _, _, page_raw, file_id = callback.data.split(":", 3)
+    if not await db.file_by_id(callback.from_user.id, file_id):
+        await callback.answer("Yozuv topilmadi", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = list(dict.fromkeys(data.get("bulk_selected", [])))
+    if file_id in selected:
+        selected.remove(file_id)
+    elif len(selected) < 50:
+        selected.append(file_id)
+    else:
+        await callback.answer("Bir vaqtda ko‘pi bilan 50 ta tanlang", show_alert=True)
+        return
+    await state.update_data(bulk_selected=selected)
+    await callback.answer(f"{len(selected)} ta tanlandi")
+    await show_bulk_inventory(
+        callback.message, callback.from_user.id, state, max(1, int(page_raw))
+    )
+
+
+async def selected_bulk_ids(
+    callback: CallbackQuery, state: FSMContext
+) -> list[str] | None:
+    selected = list(dict.fromkeys((await state.get_data()).get("bulk_selected", [])))
+    if not selected:
+        await callback.answer("Avval kamida bitta yozuvni tanlang", show_alert=True)
+        return None
+    return selected
+
+
+@router.callback_query(F.data == "bulk:tags")
+async def bulk_tags_begin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback) or not await selected_bulk_ids(callback, state):
+        return
+    await state.set_state(Flow.bulk_tags)
+    await callback.answer()
+    await callback.message.answer(
+        "Tanlangan yozuvlarning barchasiga qo‘shiladigan teglarni yuboring. "
+        "Mavjud teglar saqlanadi. /cancel — bekor qilish."
+    )
+
+
+@router.message(Flow.bulk_tags, F.text, ~F.text.startswith("/"))
+async def bulk_tags_finish(message: Message, state: FSMContext) -> None:
+    if not await actor_user(message):
+        return
+    tags = normalize_tags(message.text)
+    if not tags:
+        await message.answer("Kamida bitta to‘g‘ri teg kiriting.")
+        return
+    selected = list((await state.get_data()).get("bulk_selected", []))
+    changed = await db.bulk_add_tags(message.from_user.id, selected, tags)
+    await state.clear()
+    await message.answer(
+        f"✅ {changed} ta yozuvga {' '.join('#' + tag for tag in tags)} qo‘shildi."
+    )
+
+
+@router.callback_query(F.data == "bulk:catalog")
+async def bulk_catalog_begin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback) or not await selected_bulk_ids(callback, state):
+        return
+    catalogs = await db.catalogs(callback.from_user.id)
+    buttons = [
+        [(f"📁 {row['name']}", f"bulk:setcat:{row['name']}")]
+        for row in catalogs
+        if len(str(row["name"]).encode("utf-8")) <= 32
+    ]
+    await callback.answer()
+    await callback.message.answer("Umumiy katalogni tanlang:", reply_markup=ikb(buttons))
+
+
+@router.callback_query(F.data.startswith("bulk:setcat:"))
+async def bulk_catalog_finish(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback):
+        return
+    selected = await selected_bulk_ids(callback, state)
+    if not selected:
+        return
+    catalog = callback.data.split(":", 2)[2]
+    changed = await db.bulk_set_catalog(callback.from_user.id, selected, catalog)
+    await state.clear()
+    await callback.answer(f"{changed} ta yozuv yangilandi", show_alert=True)
+
+
+@router.callback_query(F.data == "bulk:delete")
+async def bulk_delete_choose(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback):
+        return
+    selected = await selected_bulk_ids(callback, state)
+    if not selected:
+        return
+    await callback.answer()
+    await callback.message.answer(
+        f"⚠️ {len(selected)} ta tanlangan yozuv qayerdan o‘chirilsin?",
+        reply_markup=ikb(
+            [
+                [("🧾 Faqat indeks", "bulk:delete:index")],
+                [("🗑 Kanal + indeks", "bulk:delete:all")],
+                [("❌ Bekor", "bulk:done")],
+            ]
+        ),
+    )
+
+
+@router.callback_query(F.data.in_({"bulk:delete:index", "bulk:delete:all"}))
+async def bulk_delete_finish(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback):
+        return
+    selected = await selected_bulk_ids(callback, state)
+    if not selected:
+        return
+    deleted_ids: list[str] = []
+    failed = 0
+    delete_from_channel = callback.data.endswith(":all")
+    for row in await db.files_by_ids(callback.from_user.id, selected):
+        if not await flush_pending_super_backup(callback.from_user.id, row["id"]):
+            failed += 1
+            continue
+        if delete_from_channel:
+            try:
+                for message_id in row["channel_message_ids"]:
+                    await bot.delete_message(row["telegram_channel_id"], message_id)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                failed += 1
+                continue
+        deleted_ids.append(str(row["id"]))
+    for file_id in deleted_ids:
+        await update_super_backup_status(callback.from_user.id, file_id, "deleted")
+    changed = await db.bulk_delete_files(callback.from_user.id, deleted_ids)
+    await state.clear()
+    await callback.answer("Ommaviy o‘chirish yakunlandi", show_alert=True)
+    await callback.message.answer(
+        f"✅ {changed} ta yozuv o‘chirildi."
+        + (f" ⚠️ {failed} tasini kanaldan o‘chirib bo‘lmadi." if failed else "")
+    )
+
+
+@router.callback_query(F.data == "bulk:done")
+async def bulk_done(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer("Tanlash tugatildi")
+    if await actor_user(callback):
+        await show_inventory(callback.message, callback.from_user.id, edit=True)
+
+
 @router.message(F.text == "⭐ Sevimlilar", F.chat.type == ChatType.PRIVATE)
 async def favorite_files(message: Message) -> None:
     if not await actor_user(message):
         return
     await show_files(message, favorite=True)
+
+
+@router.message(Command("stats"), F.chat.type == ChatType.PRIVATE)
+@router.message(F.text == "📊 Statistika", F.chat.type == ChatType.PRIVATE)
+async def user_statistics(message: Message) -> None:
+    if not await actor_user(message):
+        return
+    usage = await db.user_usage(message.from_user.id)
+    files = int(usage["files"] if usage else 0)
+    records = int(usage["records"] if usage else 0)
+    total_size = int(usage["total_size"] if usage else 0)
+    await message.answer(
+        "📊 <b>KeepGram statistikangiz</b>\n\n"
+        f"📦 Saqlangan fayllar: {files}/{settings.max_files_per_user}\n"
+        f"🗂 Yozuv va to‘plamlar: {records}\n"
+        f"💾 Umumiy hajm: {human_size(total_size)} / {settings.max_total_size_mb} MB\n\n"
+        "Fayllar Render serverida emas, Telegram kanalingizda saqlanadi. Limitlar bot va indeksni tez saqlash uchun qo‘yilgan."
+    )
 
 
 @router.callback_query(F.data.startswith("list:"))
@@ -1889,6 +3058,24 @@ async def get_file(callback: CallbackQuery) -> None:
         return
     await callback.answer("Yuborilmoqda…")
     await send_stored_file(callback.from_user.id, row)
+
+
+@router.callback_query(F.data.startswith("f:replace:"))
+async def replace_file_begin(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await actor_user(callback):
+        return
+    file_id = callback.data.rsplit(":", 1)[1]
+    row = await db.file_by_id(callback.from_user.id, file_id)
+    if not row:
+        await callback.answer("Fayl topilmadi.", show_alert=True)
+        return
+    await state.set_state(Flow.replace_file)
+    await state.update_data(replace_file_id=file_id)
+    await callback.answer()
+    await callback.message.answer(
+        f"♻️ <b>{esc(row['title'])}</b> o‘rniga qo‘yiladigan bitta yangi faylni yuboring. "
+        "Nom, kod, teg va katalog saqlanib qoladi. /cancel — bekor qilish."
+    )
 
 
 @router.callback_query(F.data.startswith("f:ren:"))
@@ -2001,9 +3188,14 @@ async def delete_choose(callback: CallbackQuery) -> None:
 async def delete_index(callback: CallbackQuery) -> None:
     if not await actor_user(callback):
         return
-    removed = await db.delete_file(
-        callback.from_user.id, callback.data.rsplit(":", 1)[1]
-    )
+    file_id = callback.data.rsplit(":", 1)[1]
+    if not await flush_pending_super_backup(callback.from_user.id, file_id):
+        await callback.answer(
+            "Backup nusxasi yaratilmagani uchun o‘chirish to‘xtatildi.", show_alert=True
+        )
+        return
+    await update_super_backup_status(callback.from_user.id, file_id, "deleted")
+    removed = await db.delete_file(callback.from_user.id, file_id)
     await callback.answer(
         "Indeks o‘chirildi" if removed else "Topilmadi", show_alert=True
     )
@@ -2018,6 +3210,11 @@ async def delete_all(callback: CallbackQuery) -> None:
     if not row:
         await callback.answer("Topilmadi", show_alert=True)
         return
+    if not await flush_pending_super_backup(callback.from_user.id, file_id):
+        await callback.answer(
+            "Backup nusxasi yaratilmagani uchun o‘chirish to‘xtatildi.", show_alert=True
+        )
+        return
     for message_id in list(row["channel_message_ids"] or [row["channel_message_id"]]):
         try:
             await bot.delete_message(row["telegram_channel_id"], message_id)
@@ -2031,6 +3228,7 @@ async def delete_all(callback: CallbackQuery) -> None:
         except TelegramForbiddenError:
             await callback.answer("Bot kanalda admin emas.", show_alert=True)
             return
+    await update_super_backup_status(callback.from_user.id, file_id, "deleted")
     await db.delete_file(callback.from_user.id, file_id)
     await callback.answer("Kanal va indeksdan o‘chirildi", show_alert=True)
 
@@ -2074,7 +3272,9 @@ async def command_search(message: Message, state: FSMContext) -> None:
         await run_search(message, parts[1])
         return
     await state.set_state(Flow.search)
-    await message.answer("Fayl nomi, #teg, catalog:Nomi yoki 6 belgili kodni yuboring.")
+    await message.answer(
+        "Fayl nomi, #teg, catalog:Nomi, type:pdf, type:excel, date:2026-09 yoki 6 belgili kodni yuboring."
+    )
 
 
 @router.message(
@@ -2087,12 +3287,16 @@ async def begin_search(message: Message, state: FSMContext) -> None:
     await message.answer(
         "6 belgili kodni yuboring."
         if message.text.startswith("🔢")
-        else "Fayl nomi, #teg yoki catalog:Nomi yozing."
+        else "Fayl nomi, #teg, catalog:Nomi, type:pdf yoki date:2026-09 yozing."
     )
 
 
 async def run_search(message: Message, query: str) -> None:
-    rows = await db.search_files(message.from_user.id, query)
+    try:
+        rows = await db.search_files(message.from_user.id, query)
+    except ValueError as exc:
+        await message.answer(f"⚠️ {esc(exc)}")
+        return
     if not rows:
         await message.answer(f"🔎 “{esc(query[:100])}” bo‘yicha natija topilmadi.")
         return
@@ -2269,6 +3473,7 @@ async def settings_menu(message: Message) -> None:
     setting = await db.setting(message.from_user.id)
     index_on = bool(setting and setting["index_message_enabled"])
     fav_on = bool(setting and setting["default_favorite"])
+    manifest_on = bool(setting and setting["auto_manifest_enabled"])
     default_catalog = setting["default_catalog"] if setting else "Umumiy"
     await message.answer(
         "⚙️ <b>Sozlamalar</b>",
@@ -2281,6 +3486,12 @@ async def settings_menu(message: Message) -> None:
                     (
                         f"⭐ Avto-sevimli: {'ON' if fav_on else 'OFF'}",
                         "settings:favorite",
+                    )
+                ],
+                [
+                    (
+                        f"🛟 Avto-manifest: {'ON' if manifest_on else 'OFF'}",
+                        "settings:manifest",
                     )
                 ],
                 [("🗑 Ma’lumotlarni o‘chirish", "settings:delete")],
@@ -2369,18 +3580,22 @@ async def settings_catalog_set(callback: CallbackQuery) -> None:
     await callback.answer("Standart katalog yangilandi.", show_alert=True)
 
 
-@router.callback_query(F.data.in_({"settings:index", "settings:favorite"}))
+@router.callback_query(
+    F.data.in_({"settings:index", "settings:favorite", "settings:manifest"})
+)
 async def setting_toggle(callback: CallbackQuery) -> None:
     if not await actor_user(callback):
         return
     row = await db.setting(callback.from_user.id)
-    field = (
-        "index_message_enabled"
-        if callback.data.endswith("index")
-        else "default_favorite"
-    )
+    field = {
+        "settings:index": "index_message_enabled",
+        "settings:favorite": "default_favorite",
+        "settings:manifest": "auto_manifest_enabled",
+    }[callback.data]
     value = not bool(row and row[field])
     await db.update_setting(callback.from_user.id, field, value)
+    if field == "auto_manifest_enabled" and value:
+        await db.mark_manifest_dirty(callback.from_user.id)
     await callback.answer(f"{'Yoqildi' if value else 'O‘chirildi'}", show_alert=True)
 
 
@@ -2393,6 +3608,34 @@ async def my_data(message: Message) -> None:
     await message.answer_document(
         BufferedInputFile(payload, filename="keepgram_metadata.json"),
         caption="📄 KeepGram siz haqingizda saqlayotgan metadata eksporti.",
+    )
+
+
+@router.message(Command("backup"), F.chat.type == ChatType.PRIVATE)
+async def manual_manifest_backup(message: Message) -> None:
+    if not await actor_user(message):
+        return
+    payload = await publish_user_manifest(message.from_user.id)
+    if not payload:
+        await message.answer("⚠️ Backup uchun avval storage kanalni ulang.")
+        return
+    await message.answer_document(
+        BufferedInputFile(payload, filename="keepgram_restore_manifest.json"),
+        caption="🛟 Imzolangan KeepGram tiklash manifesti. Uni xavfsiz joyda saqlang.",
+    )
+
+
+@router.message(Command("restore"), F.chat.type == ChatType.PRIVATE)
+async def restore_manifest_begin(message: Message, state: FSMContext) -> None:
+    if not await actor_user(message):
+        return
+    if not await db.storage_by_tg(message.from_user.id):
+        await message.answer("⚠️ Avval manifestdagi eski storage kanalni qayta ulang.")
+        return
+    await state.set_state(Flow.restore_manifest)
+    await message.answer(
+        "🛟 KeepGram yaratgan <code>keepgram_restore_manifest.json</code> faylini yuboring. "
+        "Faqat o‘zingizga va hozir ulangan kanalga tegishli imzolangan manifest qabul qilinadi."
     )
 
 
@@ -2498,6 +3741,15 @@ class LoginBody(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+class BackupSettingsBody(BaseModel):
+    enabled: bool
+    channel_id: int | None = None
+
+
+class BackupSendBody(BaseModel):
+    target_chat_id: int
+
+
 login_attempts: dict[str, list[float]] = {}
 
 
@@ -2536,6 +3788,195 @@ def csrf_admin(request: Request, admin: str = Depends(session_admin)) -> str:
     return admin
 
 
+async def publish_user_manifest(telegram_id: int) -> bytes | None:
+    data = await db.export_manifest(telegram_id)
+    if not data:
+        return None
+    payload = build_manifest_bytes(data)
+    channel_id = int(data["telegram_channel_id"])
+    sent = await bot.send_document(
+        channel_id,
+        BufferedInputFile(payload, filename="keepgram_restore_manifest.json"),
+        caption=(
+            "🛟 <b>KeepGram avtomatik tiklash manifesti</b>\n"
+            "Bu fayl faqat indeks metadata va kanaldagi xabar IDlarini saqlaydi. "
+            "Tiklash uchun botga /restore yuboring."
+        ),
+        disable_notification=True,
+    )
+    old_message_id = await db.complete_manifest_backup(telegram_id, sent.message_id)
+    if old_message_id and old_message_id != sent.message_id:
+        try:
+            await bot.delete_message(channel_id, old_message_id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            log.warning("Old manifest message could not be removed: %s", old_message_id)
+    return payload
+
+
+async def manifest_backup_worker() -> None:
+    while True:
+        try:
+            for row in await db.pending_manifest_users():
+                try:
+                    await publish_user_manifest(int(row["telegram_id"]))
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    log.warning(
+                        "Manifest backup channel unavailable for telegram_id=%s",
+                        row["telegram_id"],
+                    )
+                except Exception:
+                    log.exception(
+                        "Manifest backup failed for telegram_id=%s", row["telegram_id"]
+                    )
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Manifest worker iteration failed")
+            await asyncio.sleep(15)
+
+
+manifest_worker_task: asyncio.Task[None] | None = None
+
+
+def backup_asset_card(row: Any) -> str:
+    status_label = {
+        "pending": "⏳ Kutilmoqda",
+        "processing": "🔄 Nusxalanmoqda",
+        "active": "✅ Faol",
+        "deleted": "🗑 Asl yozuv o‘chirilgan",
+        "replaced": "♻️ Yangi versiya bilan almashtirilgan",
+        "missing": "⚠️ Asl kanalda topilmadi",
+        "failed": "❌ Backup xatosi",
+    }.get(str(row["status"]), str(row["status"]))
+    created = row["created_at"].astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    return (
+        "🛡 <b>KEEPGRAM OWNER BACKUP</b>\n\n"
+        f"👤 Egasi: {esc(row['owner_name'] or 'Noma’lum')}"
+        f"{(' (@' + esc(row['owner_username']) + ')') if row['owner_username'] else ''}\n"
+        f"🆔 Telegram ID: <code>{row['owner_telegram_id']}</code>\n"
+        f"🕓 Qabul qilindi: {created}\n"
+        f"📡 Asl kanal: {esc(row['source_channel_title'] or 'Noma’lum')} "
+        f"(<code>{row['source_channel_id']}</code>)\n"
+        f"📝 Nomi: {esc(row['title'])}\n"
+        f"🔢 Kod: <code>{row['code']}</code>\n"
+        f"🧩 Turi: {esc(kinds_text(list(row['file_kinds'] or [])))}\n"
+        f"📦 Tarkib: {row['item_count']} ta\n"
+        f"🔄 Versiya: {row['version']}\n"
+        f"📌 Holati: <b>{status_label}</b>"
+    )
+
+
+async def super_backup_allowed(telegram_id: int) -> bool:
+    return telegram_id in configured_admin_telegram_ids()
+
+
+async def process_super_backup_asset(row: asyncpg.Record) -> None:
+    backup_channel_id = int(row["super_backup_channel_id"])
+    copied = await bot.copy_messages(
+        chat_id=backup_channel_id,
+        from_chat_id=int(row["source_channel_id"]),
+        message_ids=list(row["source_message_ids"]),
+        disable_notification=True,
+    )
+    copied_ids = [item.message_id for item in copied]
+    try:
+        card_row = dict(row)
+        card_row["status"] = "active"
+        index_message = await bot.send_message(
+            backup_channel_id,
+            backup_asset_card(card_row),
+            disable_notification=True,
+        )
+    except Exception:
+        for message_id in copied_ids:
+            try:
+                await bot.delete_message(backup_channel_id, message_id)
+            except Exception:  # noqa: BLE001 - backup rollback is best effort
+                log.warning("Backup rollback failed for message_id=%s", message_id)
+        raise
+    await db.complete_super_backup(
+        row["id"], backup_channel_id, copied_ids, index_message.message_id
+    )
+
+
+async def super_backup_worker() -> None:
+    while True:
+        try:
+            await db.requeue_stale_super_backups()
+            for candidate in await db.pending_super_backups():
+                row = await db.claim_super_backup(candidate["id"])
+                if not row:
+                    continue
+                try:
+                    await process_super_backup_asset(row)
+                except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                    await db.fail_super_backup(row["id"], exc.__class__.__name__)
+                    log.warning("Super backup failed for asset=%s", row["id"])
+                except Exception as exc:
+                    await db.fail_super_backup(row["id"], exc.__class__.__name__)
+                    log.exception("Super backup worker failed for asset=%s", row["id"])
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("Super backup worker iteration failed")
+            await asyncio.sleep(3)
+
+
+async def update_super_backup_status(
+    telegram_id: int, file_id: UUID | str, new_status: str
+) -> None:
+    for row in await db.set_super_backup_status(telegram_id, file_id, new_status):
+        if not row["backup_channel_id"] or not row["index_message_id"]:
+            continue
+        try:
+            await bot.edit_message_text(
+                backup_asset_card(row),
+                chat_id=row["backup_channel_id"],
+                message_id=row["index_message_id"],
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            log.warning("Backup status message could not be updated for asset=%s", row["id"])
+
+
+async def flush_pending_super_backup(
+    telegram_id: int, file_id: UUID | str
+) -> bool:
+    if not await super_backup_allowed(telegram_id):
+        return True
+    config = await db.super_backup_config()
+    if not config["super_backup_enabled"] or not config["super_backup_channel_id"]:
+        return True
+    latest = await db.latest_super_backup_for_file(telegram_id, file_id)
+    if not latest or latest["status"] in {"deleted", "replaced", "missing"}:
+        await db.enqueue_super_backup(telegram_id, file_id)
+    for _ in range(50):
+        latest = await db.latest_super_backup_for_file(telegram_id, file_id)
+        if not latest:
+            return False
+        if latest["status"] == "active":
+            return True
+        if latest["status"] == "failed":
+            return False
+        if latest["status"] == "pending":
+            row = await db.claim_super_backup(latest["id"])
+            if row:
+                try:
+                    await process_super_backup_asset(row)
+                except Exception as exc:
+                    await db.fail_super_backup(row["id"], exc.__class__.__name__)
+                    log.exception("Urgent super backup failed for asset=%s", row["id"])
+                    return False
+                return True
+        await asyncio.sleep(0.2)
+    log.warning("Timed out waiting for super backup file_id=%s", file_id)
+    return False
+
+
+super_backup_worker_task: asyncio.Task[None] | None = None
+
+
 async def admin_log(
     admin: str,
     action: str,
@@ -2548,6 +3989,7 @@ async def admin_log(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global manifest_worker_task, redis_album_worker_task, super_backup_worker_task
     await db.connect()
     if await db.ensure_schema():
         log.info("Fresh database detected; KeepGram schema installed automatically")
@@ -2558,15 +4000,31 @@ async def lifespan(_: FastAPI):
             BotCommand(command="search", description="Fayl qidirish"),
             BotCommand(command="recent", description="Oxirgi fayllar"),
             BotCommand(command="all", description="Barcha saqlanganlar"),
+            BotCommand(command="stats", description="Fayl statistikasi"),
             BotCommand(command="catalogs", description="Kataloglar"),
             BotCommand(command="tags", description="Teglar"),
             BotCommand(command="settings", description="Sozlamalar"),
             BotCommand(command="channel", description="Storage kanal"),
             BotCommand(command="mydata", description="Metadata eksporti"),
+            BotCommand(command="backup", description="Tiklash manifesti"),
+            BotCommand(command="restore", description="Manifestdan tiklash"),
             BotCommand(command="privacy", description="Maxfiylik"),
             BotCommand(command="help", description="Yordam"),
         ]
     )
+    await db.ready().execute(
+        """UPDATE storage_channels s SET manifest_dirty_at=now()
+           FROM user_settings us WHERE us.user_id=s.user_id
+             AND us.auto_manifest_enabled AND s.manifest_message_id IS NULL"""
+    )
+    manifest_worker_task = asyncio.create_task(manifest_backup_worker())
+    super_backup_worker_task = asyncio.create_task(super_backup_worker())
+    if redis_client:
+        await redis_client.ping()
+        redis_album_worker_task = asyncio.create_task(redis_album_worker())
+        log.info("Redis connected; persistent FSM and album queue enabled")
+    else:
+        log.warning("REDIS_URL is not set; using in-memory FSM and album queue")
     webhook_secret = settings.webhook_secret.get_secret_value()
     webhook_url = f"{settings.app_base_url}/telegram/webhook"
     await bot.set_webhook(
@@ -2579,10 +4037,20 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        if manifest_worker_task:
+            manifest_worker_task.cancel()
+            await asyncio.gather(manifest_worker_task, return_exceptions=True)
+        if super_backup_worker_task:
+            super_backup_worker_task.cancel()
+            await asyncio.gather(super_backup_worker_task, return_exceptions=True)
+        if redis_album_worker_task:
+            redis_album_worker_task.cancel()
+            await asyncio.gather(redis_album_worker_task, return_exceptions=True)
         pending_albums = list(album_tasks.values())
         if pending_albums:
             await asyncio.gather(*pending_albums, return_exceptions=True)
         await bot.session.close()
+        await dp.storage.close()
         await db.close()
 
 
@@ -2630,7 +4098,8 @@ async def root() -> str:
 async def health() -> JSONResponse:
     connected = await db.ping()
     schema = connected and await db.schema_ready()
-    ok = connected and schema
+    redis_status = await redis_healthy()
+    ok = connected and schema and redis_status is not False
     return JSONResponse(
         {
             "status": "ok" if ok else "degraded",
@@ -2638,6 +4107,7 @@ async def health() -> JSONResponse:
             "version": APP_VERSION,
             "database": connected,
             "schema": schema,
+            "redis": redis_status,
         },
         status_code=200 if ok else 503,
     )
@@ -2927,6 +4397,170 @@ async def admin_files(
     }
 
 
+@app.get("/api/admin/backup/settings")
+async def admin_backup_settings(_: str = Depends(session_admin)) -> dict[str, Any]:
+    config = await db.super_backup_config()
+    channel_title: str | None = None
+    if config["super_backup_channel_id"]:
+        try:
+            chat = await bot.get_chat(config["super_backup_channel_id"])
+            channel_title = chat.title
+        except (TelegramBadRequest, TelegramForbiddenError):
+            channel_title = None
+    return {
+        **jsonable(config),
+        "channel_title": channel_title,
+        "allowed_owner_ids": sorted(configured_admin_telegram_ids()),
+    }
+
+
+@app.post("/api/admin/backup/settings")
+async def admin_update_backup_settings(
+    body: BackupSettingsBody, admin: str = Depends(csrf_admin)
+) -> dict[str, Any]:
+    channel_id = body.channel_id
+    if body.enabled:
+        if not channel_id:
+            raise HTTPException(422, "Backup kanal ID majburiy")
+        if not configured_admin_telegram_ids():
+            raise HTTPException(
+                422, "Avval ADMIN_TELEGRAM_IDS ichiga o‘zingizning Telegram ID’ingizni yozing"
+            )
+        used = await db.ready().fetchval(
+            "SELECT EXISTS(SELECT 1 FROM storage_channels WHERE telegram_channel_id=$1)",
+            channel_id,
+        )
+        if used:
+            raise HTTPException(409, "Backup kanal alohida kanal bo‘lishi kerak")
+        try:
+            member = await bot.get_chat_member(channel_id, bot.id)
+            if member.status not in {
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            } or not all(
+                (
+                    getattr(member, "can_post_messages", False),
+                    getattr(member, "can_edit_messages", False),
+                    getattr(member, "can_delete_messages", False),
+                )
+            ):
+                raise HTTPException(
+                    422,
+                    "Botga backup kanalda Post, Edit va Delete Messages huquqlarini bering",
+                )
+            await bot.get_chat(channel_id)
+        except HTTPException:
+            raise
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            raise HTTPException(
+                422, "Backup kanal topilmadi yoki bot admin emas"
+            ) from exc
+    row = await db.set_super_backup_config(body.enabled, channel_id)
+    queued = 0
+    if body.enabled and channel_id:
+        queued = await db.enqueue_existing_owner_backups(
+            sorted(configured_admin_telegram_ids()), channel_id
+        )
+    await admin_log(
+        admin,
+        "update_super_backup",
+        "channel",
+        str(channel_id or "disabled"),
+        {"enabled": body.enabled, "queued_existing": queued},
+    )
+    return {**jsonable(row), "queued_existing": queued}
+
+
+@app.get("/api/admin/backups")
+async def admin_backups(
+    search: str = Query("", max_length=100),
+    backup_status: str = Query("all", alias="status", max_length=16),
+    telegram_id: int | None = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
+    _: str = Depends(session_admin),
+) -> dict[str, Any]:
+    allowed_statuses = {
+        "all", "pending", "processing", "active", "deleted", "replaced", "missing", "failed"
+    }
+    if backup_status not in allowed_statuses:
+        raise HTTPException(422, "Noto‘g‘ri backup holati")
+    filters = ["1=1"]
+    args: list[Any] = []
+
+    def add(value: Any) -> str:
+        args.append(value)
+        return f"${len(args)}"
+
+    if backup_status != "all":
+        filters.append(f"b.status={add(backup_status)}")
+    if telegram_id is not None:
+        filters.append(f"b.owner_telegram_id={add(telegram_id)}")
+    if search:
+        placeholder = add(search)
+        filters.append(
+            f"(b.title ILIKE '%'||{placeholder}||'%' OR b.code ILIKE '%'||{placeholder}||'%')"
+        )
+    where = " AND ".join(filters)
+    total = await db.ready().fetchval(f"SELECT count(*) FROM backup_assets b WHERE {where}", *args)
+    args.extend([limit, (page - 1) * limit])
+    rows = await db.ready().fetch(
+        f"""SELECT b.* FROM backup_assets b WHERE {where}
+            ORDER BY b.created_at DESC LIMIT ${len(args)-1} OFFSET ${len(args)}""",
+        *args,
+    )
+    stats = await db.ready().fetchrow(
+        """SELECT count(*)::int total,COALESCE(sum(item_count),0)::int files,
+                  count(*) FILTER(WHERE status='active')::int active,
+                  count(*) FILTER(WHERE status='deleted')::int deleted,
+                  count(*) FILTER(WHERE status='failed')::int failed
+           FROM backup_assets"""
+    )
+    return {
+        "items": jsonable(rows),
+        "stats": jsonable(stats),
+        "total": int(total),
+        "page": page,
+        "limit": limit,
+    }
+
+
+@app.post("/api/admin/backups/{backup_id}/send")
+async def admin_send_backup(
+    backup_id: UUID, body: BackupSendBody, admin: str = Depends(csrf_admin)
+) -> dict[str, Any]:
+    row = await db.backup_asset(backup_id)
+    if not row or not row["backup_channel_id"] or not row["backup_message_ids"]:
+        raise HTTPException(404, "Tayyor backup fayli topilmadi")
+    try:
+        sent = await bot.copy_messages(
+            chat_id=body.target_chat_id,
+            from_chat_id=row["backup_channel_id"],
+            message_ids=list(row["backup_message_ids"]),
+        )
+        await bot.send_message(body.target_chat_id, backup_asset_card(row))
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        raise HTTPException(422, "Telegram manziliga yuborib bo‘lmadi") from exc
+    await admin_log(
+        admin,
+        "send_backup",
+        "backup_asset",
+        str(backup_id),
+        {"target_chat_id": body.target_chat_id},
+    )
+    return {"ok": True, "sent_messages": len(sent)}
+
+
+@app.post("/api/admin/backups/{backup_id}/retry")
+async def admin_retry_backup(
+    backup_id: UUID, admin: str = Depends(csrf_admin)
+) -> dict[str, bool]:
+    if not await db.retry_super_backup(backup_id):
+        raise HTTPException(409, "Faqat failed holatidagi backup qayta navbatga olinadi")
+    await admin_log(admin, "retry_backup", "backup_asset", str(backup_id))
+    return {"ok": True}
+
+
 @app.get("/api/admin/audit-logs")
 async def admin_audit_logs(
     page: int = Query(1, ge=1),
@@ -2950,6 +4584,7 @@ async def admin_system(_: str = Depends(session_admin)) -> dict[str, Any]:
         "version": APP_VERSION,
         "environment": settings.app_env,
         "database": await db.ping(),
+        "redis": await redis_healthy(),
         "webhook_url": info.url,
         "pending_updates": info.pending_update_count,
         "last_error": info.last_error_message,
