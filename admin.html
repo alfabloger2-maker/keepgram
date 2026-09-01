@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KeepGram Admin</title>
+  <style>
+    :root{--bg:#f4f7ff;--panel:#fff;--ink:#111b4d;--muted:#69738e;--line:#e2e7f4;--blue:#176cf5;--cyan:#16cbb9;--danger:#dc3155;--shadow:0 16px 46px #1b43a51a}
+    *{box-sizing:border-box}body{margin:0;font:14px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;color:var(--ink);background:radial-gradient(circle at 90% 0,#dffcf9 0,transparent 28%),var(--bg)}
+    button,input{font:inherit}.hidden{display:none!important}.login{min-height:100vh;display:grid;place-items:center;padding:24px}.login-card{width:min(440px,100%);background:#fff;border:1px solid var(--line);border-radius:28px;padding:38px;box-shadow:var(--shadow)}
+    .brand{display:flex;align-items:center;gap:13px;font-weight:800;font-size:24px}.brand img{width:54px;height:54px;border-radius:16px;object-fit:cover}.brand em{font-style:normal;color:var(--blue)}
+    h1{font-size:28px;margin:28px 0 6px}p.muted,.muted{color:var(--muted)}label{display:block;font-weight:700;margin:18px 0 7px}.input{width:100%;border:1px solid var(--line);border-radius:12px;padding:12px 14px;outline:none;background:#fbfcff}.input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #176cf51c}
+    .btn{border:0;border-radius:11px;padding:10px 15px;font-weight:750;cursor:pointer;background:#edf2ff;color:var(--ink)}.btn:hover{filter:brightness(.97)}.btn.primary{background:linear-gradient(135deg,var(--blue),#294ee8);color:#fff}.btn.danger{background:#fff0f3;color:var(--danger)}.btn.small{padding:6px 9px;font-size:12px}.wide{width:100%;margin-top:22px}.error{color:var(--danger);min-height:22px;margin-top:12px}
+    .shell{display:grid;grid-template-columns:240px 1fr;min-height:100vh}.side{background:#0e1744;color:#fff;padding:24px 18px;position:sticky;top:0;height:100vh}.side .brand{margin-bottom:30px}.side .brand img{width:44px;height:44px}.nav{display:grid;gap:7px}.nav button{width:100%;text-align:left;background:transparent;color:#bfc8e8;border:0;border-radius:12px;padding:11px 13px;cursor:pointer;font-weight:700}.nav button.active,.nav button:hover{color:#fff;background:#ffffff17}.side-foot{position:absolute;bottom:22px;left:18px;right:18px}.main{min-width:0;padding:30px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:25px}.top h2{font-size:27px;margin:0}.grid{display:grid;grid-template-columns:repeat(5,minmax(135px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 7px 26px #203d8210}.metric b{display:block;font-size:28px;margin-top:8px}.metric span{color:var(--muted);font-weight:650}.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:17px}.card h3{margin:0 0 14px;font-size:17px}
+    .toolbar{display:flex;gap:9px;align-items:center;margin-bottom:14px}.toolbar .input{max-width:390px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:16px;background:#fff}table{width:100%;border-collapse:collapse;min-width:780px}th,td{padding:11px 13px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);background:#f8faff}td.title{white-space:normal;min-width:210px}.badge{display:inline-block;border-radius:999px;padding:4px 8px;background:#ecf8f3;color:#13805f;font-size:12px;font-weight:800}.badge.bad{background:#fff0f3;color:var(--danger)}.badge.info{background:#edf4ff;color:var(--blue)}
+    .pager{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:13px}.empty{padding:40px;text-align:center;color:var(--muted)}.list{display:grid;gap:9px}.list-row{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid var(--line);padding:8px 0}.list-row:last-child{border:0}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.modal{position:fixed;inset:0;background:#0a1238b8;display:grid;place-items:center;padding:22px;z-index:20}.modal-card{width:min(950px,100%);max-height:90vh;overflow:auto;background:#fff;border-radius:22px;padding:24px}.modal-head{display:flex;justify-content:space-between;align-items:center}.facts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:16px 0}.fact{background:#f7f9ff;border-radius:12px;padding:11px}.fact small{display:block;color:var(--muted)}.mobile-menu{display:none}
+    @media(max-width:1050px){.grid{grid-template-columns:repeat(3,1fr)}.cols{grid-template-columns:1fr}}
+    @media(max-width:760px){.shell{grid-template-columns:1fr}.side{position:relative;height:auto;padding:13px 16px}.side .brand{margin:0}.side .brand span{font-size:20px}.nav{display:none;margin-top:13px}.nav.open{display:grid}.side-foot{position:static;margin-top:10px}.mobile-menu{display:block;margin-left:auto}.side>.brand{display:flex}.main{padding:18px}.grid{grid-template-columns:1fr 1fr}.facts{grid-template-columns:1fr 1fr}.top{align-items:flex-start}.top h2{font-size:23px}}
+    @media(max-width:440px){.grid,.facts{grid-template-columns:1fr}.login-card{padding:25px}.main{padding:13px}}
+  </style>
+</head>
+<body>
+  <section id="login" class="login">
+    <form id="loginForm" class="login-card">
+      <div class="brand"><img src="/assets/logo.png" alt="KeepGram"><span>Keep<em>Gram</em></span></div>
+      <h1>Admin panel</h1><p class="muted">Faqat metadata boshqaruvi. Real fayl kontenti ko‘rsatilmaydi.</p>
+      <label for="username">Login</label><input class="input" id="username" autocomplete="username" required>
+      <label for="password">Parol</label><input class="input" id="password" type="password" autocomplete="current-password" required>
+      <button class="btn primary wide" type="submit">🔐 Kirish</button><div id="loginError" class="error"></div>
+    </form>
+  </section>
+
+  <div id="app" class="shell hidden">
+    <aside class="side">
+      <div class="brand"><img src="/assets/logo.png" alt="KeepGram"><span>Keep<em>Gram</em></span><button id="mobileMenu" class="btn mobile-menu">☰</button></div>
+      <nav id="nav" class="nav">
+        <button data-view="dashboard" class="active">📊 Dashboard</button>
+        <button data-view="users">👥 Foydalanuvchilar</button>
+        <button data-view="channels">🔗 Kanallar</button>
+        <button data-view="files">📦 Fayl indeksi</button>
+        <button data-view="audit">🧾 Audit jurnali</button>
+        <button data-view="system">⚙️ Tizim</button>
+      </nav>
+      <div class="side-foot"><button id="logout" class="btn wide">Chiqish</button></div>
+    </aside>
+    <main class="main">
+      <header class="top"><div><h2 id="title">Dashboard</h2><div class="muted">KeepGram metadata boshqaruvi</div></div><span id="adminName" class="badge info"></span></header>
+      <div id="content"></div>
+    </main>
+  </div>
+
+  <div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><h2>Foydalanuvchi</h2><button class="btn" onclick="closeModal()">✕</button></div><div id="modalBody"></div></div></div>
+
+  <script>
+    let csrf='', view='dashboard', page=1;
+    const $=s=>document.querySelector(s);
+    const esc=v=>String(v??'').replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+    const dt=v=>v?new Date(v).toLocaleString('uz-UZ'):'—';
+    async function api(url, options={}){
+      options.headers={'Content-Type':'application/json',...(options.headers||{})};
+      if(options.method && options.method!=='GET') options.headers['X-CSRF-Token']=csrf;
+      const r=await fetch(url,{credentials:'same-origin',...options});
+      let data={}; try{data=await r.json()}catch{}
+      if(r.status===401){showLogin();throw new Error('Sessiya tugagan')}
+      if(!r.ok) throw new Error(data.detail||'So‘rov bajarilmadi'); return data;
+    }
+    function showLogin(){ $('#login').classList.remove('hidden');$('#app').classList.add('hidden') }
+    function showApp(me){csrf=me.csrf;$('#adminName').textContent=me.username;$('#login').classList.add('hidden');$('#app').classList.remove('hidden');load('dashboard')}
+    $('#loginForm').addEventListener('submit',async e=>{e.preventDefault();$('#loginError').textContent='';try{const d=await api('/api/admin/login',{method:'POST',body:JSON.stringify({username:$('#username').value,password:$('#password').value})});showApp(d)}catch(err){$('#loginError').textContent=err.message}});
+    $('#logout').onclick=async()=>{try{await api('/api/admin/logout',{method:'POST'})}finally{csrf='';showLogin()}};
+    $('#mobileMenu').onclick=()=>$('#nav').classList.toggle('open');
+    document.querySelectorAll('[data-view]').forEach(b=>b.onclick=()=>load(b.dataset.view));
+    function activate(name){view=name;page=1;document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===name));$('#nav').classList.remove('open');$('#title').textContent={dashboard:'Dashboard',users:'Foydalanuvchilar',channels:'Kanallar',files:'Fayl indeksi',audit:'Audit jurnali',system:'Tizim'}[name]}
+    async function load(name){activate(name);$('#content').innerHTML='<div class="card">Yuklanmoqda…</div>';try{await ({dashboard,users,channels,files,audit,system}[name])()}catch(e){$('#content').innerHTML=`<div class="card error">${esc(e.message)}</div>`}}
+    function metric(label,value){return `<div class="card metric"><span>${esc(label)}</span><b>${Number(value||0).toLocaleString()}</b></div>`}
+    async function dashboard(){const d=await api('/api/admin/stats');$('#content').innerHTML=`<section class="grid">${metric('Foydalanuvchilar',d.users)}${metric('Ulangan kanallar',d.channels)}${metric('Indekslangan fayllar',d.files)}${metric('Faol 24 soat',d.active_24h)}${metric('Bloklangan',d.blocked)}</section><section class="cols"><div class="card"><h3>Yangi foydalanuvchilar</h3><div class="list">${d.recent_users.map(x=>`<div class="list-row"><span>@${esc(x.username||'username yo‘q')} · ${esc(x.first_name)}</span><small>${dt(x.created_at)}</small></div>`).join('')||'<div class="empty">Ma’lumot yo‘q</div>'}</div></div><div class="card"><h3>Oxirgi indekslar</h3><div class="list">${d.recent_files.map(x=>`<div class="list-row"><span>${esc(x.title)} <span class="badge info mono">${esc(x.code)}</span></span><small>${dt(x.created_at)}</small></div>`).join('')||'<div class="empty">Ma’lumot yo‘q</div>'}</div></div></section>`}
+    function pager(total,limit,fn){const pages=Math.max(1,Math.ceil(total/limit));return `<div class="pager"><button class="btn" ${page<=1?'disabled':''} onclick="page--;${fn}()">←</button><b>${page}/${pages}</b><button class="btn" ${page>=pages?'disabled':''} onclick="page++;${fn}()">→</button></div>`}
+    async function users(){const q=$('#search')?.value||'';const d=await api(`/api/admin/users?page=${page}&limit=25&search=${encodeURIComponent(q)}`);$('#content').innerHTML=`<div class="toolbar"><input id="search" class="input" value="${esc(q)}" placeholder="ID, username, ism yoki telefon"><button class="btn primary" onclick="page=1;users()">Qidirish</button></div><div class="table-wrap"><table><thead><tr><th>Telegram</th><th>Ism</th><th>Telefon</th><th>Kanal</th><th>Fayllar</th><th>Holat</th><th>Sana</th><th>Amal</th></tr></thead><tbody>${d.items.map(u=>`<tr><td><span class="mono">${esc(u.telegram_id)}</span><br><small>@${esc(u.username||'—')}</small></td><td>${esc((u.first_name||'')+' '+(u.last_name||''))}</td><td>${esc(u.phone||'Berilmagan')}</td><td>${esc(u.channel_title||'Ulanmagan')}</td><td>${u.file_count}</td><td><span class="badge ${u.is_blocked?'bad':''}">${u.is_blocked?'Bloklangan':'Faol'}</span></td><td>${dt(u.created_at)}</td><td><button class="btn small" onclick="userDetail('${u.id}')">Ko‘rish</button></td></tr>`).join('')}</tbody></table></div>${pager(d.total,d.limit,'users')}`;$('#search').onkeydown=e=>{if(e.key==='Enter'){page=1;users()}}}
+    async function userDetail(id){const d=await api(`/api/admin/users/${id}`),u=d.user;$('#modalBody').innerHTML=`<div class="facts"><div class="fact"><small>Telegram ID</small><b class="mono">${esc(u.telegram_id)}</b></div><div class="fact"><small>Username</small><b>@${esc(u.username||'—')}</b></div><div class="fact"><small>Ism</small><b>${esc((u.first_name||'')+' '+(u.last_name||''))}</b></div><div class="fact"><small>Telefon</small><b>${esc(u.phone||'Berilmagan')}</b></div><div class="fact"><small>Kanal</small><b>${esc(u.channel_title||'Ulanmagan')}</b></div><div class="fact"><small>Fayllar / sevimli</small><b>${u.file_count} / ${u.favorite_count}</b></div></div><div class="toolbar"><button class="btn ${u.is_blocked?'':'danger'}" onclick="userAction('${id}','${u.is_blocked?'unblock':'block'}')">${u.is_blocked?'✅ Blokdan chiqarish':'🚫 Bloklash'}</button><button class="btn danger" onclick="deleteUser('${id}')">🗑 Metadata’ni o‘chirish</button></div><h3>Fayl metadata (real kontent emas)</h3><div class="table-wrap"><table><thead><tr><th>Nomi</th><th>Kod</th><th>Tur</th><th>Katalog</th><th>Teg</th><th>Sana</th></tr></thead><tbody>${d.files.map(f=>`<tr><td class="title">${esc(f.title)}</td><td class="mono">${esc(f.code)}</td><td>${esc(f.file_type)}</td><td>${esc(f.catalog)}</td><td>${esc((f.tags||[]).map(t=>'#'+t).join(' '))}</td><td>${dt(f.created_at)}</td></tr>`).join('')}</tbody></table></div>`;$('#modal').classList.remove('hidden')}
+    function closeModal(){$('#modal').classList.add('hidden')}
+    async function userAction(id,action){if(!confirm('Amal bajarilsinmi?'))return;await api(`/api/admin/users/${id}/${action}`,{method:'POST'});closeModal();users()}
+    async function deleteUser(id){if(!confirm('Metadata va indeks butunlay o‘chadi. Telegram kanal fayllari qoladi. Davom etilsinmi?'))return;await api(`/api/admin/users/${id}/metadata`,{method:'DELETE'});closeModal();users()}
+    async function channels(){const d=await api(`/api/admin/channels?page=${page}&limit=25`);$('#content').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Kanal</th><th>ID</th><th>Egasi</th><th>Fayllar</th><th>Holat</th><th>Ulangan</th><th>Amal</th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${esc(x.channel_title)}</td><td class="mono">${esc(x.telegram_channel_id)}</td><td>@${esc(x.username||'—')} · ${esc(x.telegram_id)}</td><td>${x.file_count}</td><td><span class="badge ${x.is_active?'':'bad'}">${x.is_active?'Faol':'Uzilgan'}</span></td><td>${dt(x.linked_at)}</td><td><button class="btn danger small" onclick="disconnectChannel('${x.id}')">Uzish</button></td></tr>`).join('')}</tbody></table></div>${pager(d.total,d.limit,'channels')}`}
+    async function disconnectChannel(id){if(!confirm('Kanal indeksi bilan bog‘lanish uzilsinmi?'))return;await api(`/api/admin/channels/${id}/disconnect`,{method:'POST'});channels()}
+    async function files(){const q=$('#fileSearch')?.value||'';const d=await api(`/api/admin/files?page=${page}&limit=25&search=${encodeURIComponent(q)}`);$('#content').innerHTML=`<div class="card" style="margin-bottom:14px"><b>🔐 Metadata-only:</b> bu sahifa real fayl kontentini ochmaydi.</div><div class="toolbar"><input id="fileSearch" class="input" value="${esc(q)}" placeholder="Nomi, kod yoki Telegram ID"><button class="btn primary" onclick="page=1;files()">Qidirish</button></div><div class="table-wrap"><table><thead><tr><th>Nomi</th><th>Kod</th><th>Tur</th><th>Katalog / teg</th><th>Egasi</th><th>Kanal</th><th>Sana</th></tr></thead><tbody>${d.items.map(f=>`<tr><td class="title">${esc(f.title)}</td><td class="mono">${esc(f.code)}</td><td>${esc(f.file_type)}${f.is_missing?' ⚠️':''}</td><td>${esc(f.catalog)}<br><small>${esc((f.tags||[]).map(t=>'#'+t).join(' '))}</small></td><td>${esc(f.telegram_id)}<br><small>@${esc(f.username||'—')}</small></td><td>${esc(f.channel_title)}<br><small>msg ${esc(f.channel_message_id)}</small></td><td>${dt(f.created_at)}</td></tr>`).join('')}</tbody></table></div>${pager(d.total,d.limit,'files')}`}
+    async function audit(){const d=await api(`/api/admin/audit-logs?page=${page}&limit=50`);$('#content').innerHTML=`<div class="table-wrap"><table><thead><tr><th>Vaqt</th><th>Actor</th><th>Amal</th><th>Nishon</th><th>Qo‘shimcha</th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${dt(x.created_at)}</td><td>${esc(x.actor_type)} · ${esc(x.actor_id)}</td><td><span class="badge info">${esc(x.action)}</span></td><td>${esc(x.target_type||'—')} · ${esc(x.target_id||'—')}</td><td class="mono">${esc(JSON.stringify(x.metadata||{}))}</td></tr>`).join('')}</tbody></table></div>${pager(d.total,d.limit,'audit')}`}
+    async function system(){const d=await api('/api/admin/system');$('#content').innerHTML=`<div class="facts"><div class="fact"><small>Ilova</small><b>${esc(d.app)} ${esc(d.version)}</b></div><div class="fact"><small>Muhit</small><b>${esc(d.environment)}</b></div><div class="fact"><small>Database</small><b>${d.database?'✅ Ulangan':'❌ Xato'}</b></div><div class="fact"><small>Webhook</small><b>${d.webhook_url?'✅ O‘rnatilgan':'❌ Yo‘q'}</b></div><div class="fact"><small>Kutilayotgan update</small><b>${esc(d.pending_updates)}</b></div><div class="fact"><small>Oxirgi Telegram xatosi</small><b>${esc(d.last_error||'Yo‘q')}</b></div></div><div class="card"><h3>Webhook URL</h3><span class="mono muted">${esc(d.webhook_url||'—')}</span></div>`}
+    api('/api/admin/me').then(showApp).catch(showLogin);
+  </script>
+</body>
+</html>
