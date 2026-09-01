@@ -34,6 +34,45 @@ class KeepGramCoreTests(unittest.TestCase):
             len(main.normalize_tags(" ".join(f"t{i}" for i in range(20)))), 10
         )
 
+    def test_document_types_are_classified(self):
+        cases = {
+            "scan.JPG": "image",
+            "passport.pdf": "pdf",
+            "contract.docx": "word",
+            "budget.XLSX": "excel",
+            "backup.bin": "other",
+        }
+        for file_name, expected in cases.items():
+            with self.subTest(file_name=file_name):
+                self.assertEqual(
+                    main.classify_file_kind("document", file_name), expected
+                )
+
+    def test_duplicate_title_suffix_preserves_extension(self):
+        self.assertEqual(main.title_with_suffix("passport.pdf", 2), "passport (2).pdf")
+        self.assertEqual(main.title_with_suffix("Rasm", 3), "Rasm (3)")
+
+    def test_inventory_contains_name_code_type_and_tags(self):
+        text = main.inventory_page_text(
+            [
+                {
+                    "title": "Passport",
+                    "code": "ABC234",
+                    "file_type": "pdf",
+                    "file_kinds": ["pdf"],
+                    "item_count": 1,
+                    "tags": ["hujjat"],
+                }
+            ],
+            total=1,
+            page=1,
+            pages=1,
+        )
+        self.assertIn("Passport", text)
+        self.assertIn("ABC234", text)
+        self.assertIn("PDF", text)
+        self.assertIn("#hujjat", text)
+
     def test_code_detection_is_case_insensitive(self):
         self.assertTrue(main.CODE_RE.fullmatch("a2z7km"))
         self.assertFalse(main.CODE_RE.fullmatch("O0I1AA"))
@@ -56,6 +95,8 @@ class KeepGramCoreTests(unittest.TestCase):
         schema = Path("schema.sql").read_text(encoding="utf-8")
         self.assertIn("display_name text", schema)
         self.assertIn("onboarding_completed boolean not null default false", schema)
+        self.assertIn("create table if not exists file_parts", schema)
+        self.assertIn("file_kinds text[]", schema)
 
 
 if __name__ == "__main__":

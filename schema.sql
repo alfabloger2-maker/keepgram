@@ -69,12 +69,62 @@ create table if not exists files (
   is_missing boolean not null default false,
   telegram_file_unique_id text,
   file_size bigint,
+  item_count integer not null default 1 check (item_count between 1 and 100),
+  file_kinds text[] not null default '{}',
   deleted_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique(user_id, code),
   unique(channel_id, channel_message_id)
 );
+
+alter table files add column if not exists item_count integer not null default 1;
+alter table files add column if not exists file_kinds text[] not null default '{}';
+
+update files
+set file_kinds = array[
+  case
+    when file_type = 'photo' then 'image'
+    when file_type in ('video', 'animation', 'video_note') then 'video'
+    when file_type in ('audio', 'voice') then 'audio'
+    when file_type = 'document' and lower(title) ~ '\.(jpg|jpeg|png|webp|heic|heif|bmp|tif|tiff)$' then 'image'
+    when file_type = 'document' and lower(title) ~ '\.pdf$' then 'pdf'
+    when file_type = 'document' and lower(title) ~ '\.(doc|docx|odt|rtf)$' then 'word'
+    when file_type = 'document' and lower(title) ~ '\.(xls|xlsx|xlsm|csv|ods)$' then 'excel'
+    when file_type = 'document' then 'other'
+    else file_type
+  end
+]
+where cardinality(file_kinds) = 0;
+
+create table if not exists file_parts (
+  id uuid primary key default gen_random_uuid(),
+  file_id uuid not null references files(id) on delete cascade,
+  channel_message_id bigint not null,
+  position smallint not null check (position between 0 and 99),
+  content_type varchar(32) not null,
+  file_kind varchar(32) not null,
+  file_name text,
+  file_extension varchar(16),
+  mime_type text,
+  telegram_file_unique_id text,
+  file_size bigint,
+  created_at timestamptz not null default now(),
+  unique(file_id, position),
+  unique(file_id, channel_message_id)
+);
+
+insert into file_parts(
+  file_id,channel_message_id,position,content_type,file_kind,
+  file_name,file_extension,mime_type,telegram_file_unique_id,file_size
+)
+select f.id,f.channel_message_id,0,f.file_type,f.file_kinds[1],
+       case when f.file_type='document' then f.title else null end,
+       case when f.file_type='document' and f.title like '%.%'
+            then left(lower(regexp_replace(f.title, '^.*\.', '')),16) else null end,
+       null,f.telegram_file_unique_id,f.file_size
+from files f
+where not exists (select 1 from file_parts fp where fp.file_id=f.id);
 
 create table if not exists channel_link_tokens (
   id uuid primary key default gen_random_uuid(),
@@ -100,6 +150,7 @@ create index if not exists files_user_code_idx on files(user_id, code);
 create index if not exists files_user_catalog_idx on files(user_id, catalog);
 create index if not exists files_tags_gin_idx on files using gin(tags);
 create index if not exists files_title_trgm_idx on files using gin(lower(title) gin_trgm_ops);
+create index if not exists file_parts_file_position_idx on file_parts(file_id, position);
 create index if not exists users_last_seen_idx on users(last_seen_at desc);
 create index if not exists audit_logs_created_idx on audit_logs(created_at desc);
 create index if not exists link_tokens_expiry_idx on channel_link_tokens(expires_at);
@@ -125,8 +176,9 @@ alter table storage_channels enable row level security;
 alter table user_settings enable row level security;
 alter table catalogs enable row level security;
 alter table files enable row level security;
+alter table file_parts enable row level security;
 alter table channel_link_tokens enable row level security;
 alter table audit_logs enable row level security;
 
-revoke all on table users, storage_channels, user_settings, catalogs, files,
+revoke all on table users, storage_channels, user_settings, catalogs, files, file_parts,
   channel_link_tokens, audit_logs from anon, authenticated;

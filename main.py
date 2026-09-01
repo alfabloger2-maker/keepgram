@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import html
@@ -43,7 +44,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_NAME = "KeepGram"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_RE = re.compile(r"^[A-HJ-NP-Z2-9]{6}$", re.IGNORECASE)
@@ -62,6 +63,9 @@ SUPPORTED_CONTENT = {
     "venue",
     "text",
 }
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "tif", "tiff"}
+WORD_EXTENSIONS = {"doc", "docx", "odt", "rtf"}
+EXCEL_EXTENSIONS = {"xls", "xlsx", "xlsm", "csv", "ods"}
 
 
 class Settings(BaseSettings):
@@ -175,66 +179,188 @@ def normalize_tags(raw: str) -> list[str]:
     return result[:10]
 
 
-def content_metadata(message: Message) -> tuple[str, str, str | None, int | None]:
-    stamp = message.date.astimezone(timezone.utc).strftime("%Y-%m-%d_%H-%M")
+def file_extension(file_name: str | None) -> str | None:
+    if not file_name or "." not in file_name:
+        return None
+    extension = file_name.rsplit(".", 1)[1].lower()
+    extension = re.sub(r"[^a-z0-9]", "", extension)[:16]
+    return extension or None
+
+
+def classify_file_kind(
+    content_type: str, file_name: str | None = None, mime_type: str | None = None
+) -> str:
+    extension = file_extension(file_name)
+    mime = (mime_type or "").lower()
+    if content_type == "document":
+        if extension in IMAGE_EXTENSIONS or mime.startswith("image/"):
+            return "image"
+        if extension == "pdf" or mime == "application/pdf":
+            return "pdf"
+        if (
+            extension in WORD_EXTENSIONS
+            or "wordprocessingml" in mime
+            or mime == "application/msword"
+        ):
+            return "word"
+        if (
+            extension in EXCEL_EXTENSIONS
+            or "spreadsheetml" in mime
+            or "ms-excel" in mime
+        ):
+            return "excel"
+        return "other"
+    return {
+        "photo": "image",
+        "video": "video",
+        "animation": "video",
+        "video_note": "video",
+        "audio": "audio",
+        "voice": "audio",
+        "text": "text",
+        "sticker": "sticker",
+        "contact": "contact",
+        "location": "location",
+        "venue": "location",
+    }.get(content_type, "other")
+
+
+def file_kind_label(file_kind: str) -> str:
+    return {
+        "image": "Rasm",
+        "pdf": "PDF",
+        "word": "Word",
+        "excel": "Excel",
+        "video": "Video",
+        "audio": "Audio",
+        "text": "Matn",
+        "sticker": "Stiker",
+        "contact": "Kontakt",
+        "location": "Joylashuv",
+        "collection": "To‘plam",
+        "photo": "Rasm",
+        "document": "Boshqa fayl",
+        "animation": "Video",
+        "voice": "Audio",
+        "video_note": "Video",
+        "venue": "Joylashuv",
+    }.get(file_kind, "Boshqa fayl")
+
+
+def clean_title(value: str | None, fallback: str) -> str:
+    cleaned = re.sub(r"[\x00-\x1f]", " ", value or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return (cleaned or fallback)[:180]
+
+
+def content_metadata(message: Message) -> dict[str, Any]:
+    stamp = message.date.astimezone(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
     content_type = message.content_type
     file_unique_id: str | None = None
     file_size: int | None = None
+    file_name: str | None = None
+    mime_type: str | None = None
     if message.document:
-        title = message.document.file_name or f"Hujjat_{stamp}"
+        file_name = message.document.file_name
+        mime_type = message.document.mime_type
+        title = file_name or f"Fayl_{stamp}_{message.message_id}"
         file_unique_id, file_size = (
             message.document.file_unique_id,
             message.document.file_size,
         )
     elif message.photo:
-        title = f"Rasm_{stamp}"
+        file_name, mime_type = None, "image/jpeg"
+        title = clean_title(message.caption, f"Rasm_{stamp}_{message.message_id}")
         file_unique_id, file_size = (
             message.photo[-1].file_unique_id,
             message.photo[-1].file_size,
         )
     elif message.video:
-        title = message.video.file_name or f"Video_{stamp}"
+        file_name, mime_type = message.video.file_name, message.video.mime_type
+        title = file_name or clean_title(
+            message.caption, f"Video_{stamp}_{message.message_id}"
+        )
         file_unique_id, file_size = (
             message.video.file_unique_id,
             message.video.file_size,
         )
     elif message.audio:
-        title = message.audio.file_name or message.audio.title or f"Audio_{stamp}"
+        file_name, mime_type = message.audio.file_name, message.audio.mime_type
+        title = (
+            file_name or message.audio.title or f"Audio_{stamp}_{message.message_id}"
+        )
         file_unique_id, file_size = (
             message.audio.file_unique_id,
             message.audio.file_size,
         )
     elif message.voice:
-        title = f"Ovoz_{stamp}"
+        mime_type = message.voice.mime_type
+        title = f"Ovoz_{stamp}_{message.message_id}"
         file_unique_id, file_size = (
             message.voice.file_unique_id,
             message.voice.file_size,
         )
     elif message.animation:
-        title = message.animation.file_name or f"GIF_{stamp}"
+        file_name, mime_type = message.animation.file_name, message.animation.mime_type
+        title = file_name or f"GIF_{stamp}_{message.message_id}"
         file_unique_id, file_size = (
             message.animation.file_unique_id,
             message.animation.file_size,
         )
     elif message.sticker:
-        title = f"Sticker_{stamp}"
+        mime_type = "image/webp"
+        title = f"Sticker_{stamp}_{message.message_id}"
         file_unique_id, file_size = (
             message.sticker.file_unique_id,
             message.sticker.file_size,
         )
     elif message.video_note:
-        title = f"Video_xabar_{stamp}"
+        title = f"Video_xabar_{stamp}_{message.message_id}"
         file_unique_id, file_size = (
             message.video_note.file_unique_id,
             message.video_note.file_size,
         )
     elif message.contact:
-        title = f"Kontakt_{message.contact.first_name}_{stamp}"
+        title = f"Kontakt_{message.contact.first_name}_{stamp}_{message.message_id}"
     elif message.location or message.venue:
-        title = f"Joylashuv_{stamp}"
+        title = f"Joylashuv_{stamp}_{message.message_id}"
     else:
-        title = f"Matn_{stamp}"
-    return content_type, title[:180], file_unique_id, file_size
+        title = clean_title(message.text, f"Matn_{stamp}_{message.message_id}")
+    title = clean_title(title, f"Fayl_{stamp}_{message.message_id}")
+    return {
+        "content_type": content_type,
+        "file_kind": classify_file_kind(content_type, file_name, mime_type),
+        "title": title,
+        "file_name": file_name,
+        "file_extension": file_extension(file_name),
+        "mime_type": mime_type,
+        "file_unique_id": file_unique_id,
+        "file_size": file_size,
+    }
+
+
+def collection_title(messages: list[Message], parts: list[dict[str, Any]]) -> str:
+    if len(parts) == 1:
+        return str(parts[0]["title"])
+    caption = next((message.caption for message in messages if message.caption), None)
+    if caption:
+        return clean_title(caption, "Fayllar to‘plami")
+    kinds = list(dict.fromkeys(str(part["file_kind"]) for part in parts))
+    base = f"{file_kind_label(kinds[0])}lar" if len(kinds) == 1 else "Fayllar_to‘plami"
+    stamp = messages[0].date.astimezone(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+    return clean_title(None, f"{base}_{stamp}_{messages[0].message_id}")
+
+
+def title_with_suffix(title: str, number: int, max_length: int = 180) -> str:
+    if number <= 1:
+        return title[:max_length]
+    suffix = f" ({number})"
+    if "." in title and not title.startswith("."):
+        stem, extension = title.rsplit(".", 1)
+        if 1 <= len(extension) <= 16 and re.fullmatch(r"[A-Za-z0-9]+", extension):
+            ending = f"{suffix}.{extension}"
+            return f"{stem[: max_length - len(ending)]}{ending}"
+    return f"{title[: max_length - len(suffix)]}{suffix}"
 
 
 class Database:
@@ -282,6 +408,7 @@ class Database:
                        AND to_regclass('public.user_settings') IS NOT NULL
                        AND to_regclass('public.catalogs') IS NOT NULL
                        AND to_regclass('public.files') IS NOT NULL
+                       AND to_regclass('public.file_parts') IS NOT NULL
                        AND to_regclass('public.channel_link_tokens') IS NOT NULL
                        AND to_regclass('public.audit_logs') IS NOT NULL
                     """
@@ -475,40 +602,103 @@ class Database:
             value,
         )
 
+    async def unique_file_title(
+        self,
+        conn: asyncpg.Connection,
+        user_id: UUID,
+        requested: str,
+        exclude_file_id: UUID | None = None,
+    ) -> str:
+        base = clean_title(requested, "Nomsiz fayl")
+        for number in range(1, 10_001):
+            candidate = title_with_suffix(base, number)
+            exists = await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM files
+                   WHERE user_id=$1 AND lower(title)=lower($2) AND deleted_at IS NULL
+                     AND ($3::uuid IS NULL OR id<>$3))""",
+                user_id,
+                candidate,
+                exclude_file_id,
+            )
+            if not exists:
+                return candidate
+        raise RuntimeError("Noyob fayl nomini yaratib bo‘lmadi")
+
     async def create_file(
         self,
         telegram_id: int,
-        channel_message_id: int,
         title: str,
-        file_type: str,
-        file_unique_id: str | None,
-        file_size: int | None,
+        parts: list[dict[str, Any]],
     ) -> asyncpg.Record:
-        for _ in range(12):
-            code = make_code()
-            try:
-                row = await self.ready().fetchrow(
-                    """INSERT INTO files(user_id,channel_id,channel_message_id,code,title,file_type,
-                       catalog,tags,is_favorite,telegram_file_unique_id,file_size)
-                       SELECT u.id,s.id,$2,$3,$4,$5,COALESCE(us.default_catalog,'Umumiy'),'{}'::text[],
-                              COALESCE(us.default_favorite,false),$6,$7
-                       FROM users u JOIN storage_channels s ON s.user_id=u.id AND s.is_active=true
-                       LEFT JOIN user_settings us ON us.user_id=u.id
-                       WHERE u.telegram_id=$1 AND u.is_blocked=false RETURNING *""",
-                    telegram_id,
-                    channel_message_id,
-                    code,
-                    title,
-                    file_type,
-                    file_unique_id,
-                    file_size,
+        if not parts:
+            raise ValueError("Kamida bitta fayl qismi kerak")
+        async with self.ready().acquire() as conn, conn.transaction():
+            context = await conn.fetchrow(
+                """SELECT u.id AS user_id,s.id AS channel_id,
+                          COALESCE(us.default_catalog,'Umumiy') AS catalog,
+                          COALESCE(us.default_favorite,false) AS is_favorite
+                   FROM users u JOIN storage_channels s ON s.user_id=u.id AND s.is_active=true
+                   LEFT JOIN user_settings us ON us.user_id=u.id
+                   WHERE u.telegram_id=$1 AND u.is_blocked=false FOR UPDATE OF u""",
+                telegram_id,
+            )
+            if not context:
+                raise PermissionError("Faol kanal topilmadi")
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1))", str(context["user_id"])
+            )
+            unique_title = await self.unique_file_title(conn, context["user_id"], title)
+            kinds = list(dict.fromkeys(str(part["file_kind"]) for part in parts))
+            total_size = sum(int(part["file_size"] or 0) for part in parts) or None
+            first = parts[0]
+            row: asyncpg.Record | None = None
+            for _ in range(12):
+                row = await conn.fetchrow(
+                    """INSERT INTO files(
+                           user_id,channel_id,channel_message_id,code,title,file_type,
+                           catalog,tags,is_favorite,telegram_file_unique_id,file_size,
+                           item_count,file_kinds)
+                       VALUES($1,$2,$3,$4,$5,$6,$7,'{}'::text[],$8,$9,$10,$11,$12)
+                       ON CONFLICT (user_id,code) DO NOTHING RETURNING *""",
+                    context["user_id"],
+                    context["channel_id"],
+                    first["channel_message_id"],
+                    make_code(),
+                    unique_title,
+                    kinds[0] if len(kinds) == 1 else "collection",
+                    context["catalog"],
+                    context["is_favorite"],
+                    first["file_unique_id"],
+                    total_size,
+                    len(parts),
+                    kinds,
                 )
-                if not row:
-                    raise PermissionError("Faol kanal topilmadi")
-                return row
-            except asyncpg.UniqueViolationError:
-                continue
-        raise RuntimeError("Noyob kod yaratib bo‘lmadi")
+                if row:
+                    break
+            if not row:
+                raise RuntimeError("Noyob kod yaratib bo‘lmadi")
+            await conn.executemany(
+                """INSERT INTO file_parts(
+                       file_id,channel_message_id,position,content_type,file_kind,
+                       file_name,file_extension,mime_type,telegram_file_unique_id,file_size)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+                [
+                    (
+                        row["id"],
+                        part["channel_message_id"],
+                        position,
+                        part["content_type"],
+                        part["file_kind"],
+                        part["file_name"],
+                        part["file_extension"],
+                        part["mime_type"],
+                        part["file_unique_id"],
+                        part["file_size"],
+                    )
+                    for position, part in enumerate(parts)
+                ],
+            )
+            return row
 
     async def file_by_id(
         self, telegram_id: int, file_id: UUID | str
@@ -517,7 +707,11 @@ class Database:
         if not parsed:
             return None
         return await self.ready().fetchrow(
-            """SELECT f.*,s.telegram_channel_id FROM files f
+            """SELECT f.*,s.telegram_channel_id,
+                      COALESCE((SELECT array_agg(fp.channel_message_id ORDER BY fp.position)
+                                FROM file_parts fp WHERE fp.file_id=f.id),
+                               ARRAY[f.channel_message_id]) AS channel_message_ids
+               FROM files f
                JOIN users u ON u.id=f.user_id JOIN storage_channels s ON s.id=f.channel_id
                WHERE f.id=$2 AND u.telegram_id=$1 AND f.deleted_at IS NULL""",
             telegram_id,
@@ -526,7 +720,11 @@ class Database:
 
     async def file_by_code(self, telegram_id: int, code: str) -> asyncpg.Record | None:
         return await self.ready().fetchrow(
-            """SELECT f.*,s.telegram_channel_id FROM files f
+            """SELECT f.*,s.telegram_channel_id,
+                      COALESCE((SELECT array_agg(fp.channel_message_id ORDER BY fp.position)
+                                FROM file_parts fp WHERE fp.file_id=f.id),
+                               ARRAY[f.channel_message_id]) AS channel_message_ids
+               FROM files f
                JOIN users u ON u.id=f.user_id JOIN storage_channels s ON s.id=f.channel_id
                WHERE u.telegram_id=$1 AND upper(f.code)=upper($2) AND f.deleted_at IS NULL""",
             telegram_id,
@@ -619,6 +817,29 @@ class Database:
         parsed = safe_uuid(file_id)
         if not parsed:
             return None
+        if field == "title":
+            async with self.ready().acquire() as conn, conn.transaction():
+                target = await conn.fetchrow(
+                    """SELECT f.id,f.user_id FROM files f JOIN users u ON u.id=f.user_id
+                       WHERE u.telegram_id=$1 AND f.id=$2 AND f.deleted_at IS NULL
+                       FOR UPDATE OF f""",
+                    telegram_id,
+                    parsed,
+                )
+                if not target:
+                    return None
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    str(target["user_id"]),
+                )
+                unique_title = await self.unique_file_title(
+                    conn, target["user_id"], str(value), parsed
+                )
+                return await conn.fetchrow(
+                    "UPDATE files SET title=$2,updated_at=now() WHERE id=$1 RETURNING *",
+                    parsed,
+                    unique_title,
+                )
         return await self.ready().fetchrow(
             f"""UPDATE files f SET {field}=$3,updated_at=now() FROM users u
                 WHERE f.user_id=u.id AND u.telegram_id=$1 AND f.id=$2 AND f.deleted_at IS NULL
@@ -702,7 +923,8 @@ class Database:
             return None
         channel = await self.storage_by_tg(telegram_id)
         files = await self.ready().fetch(
-            """SELECT f.code,f.title,f.file_type,f.catalog,f.tags,f.is_favorite,f.created_at
+            """SELECT f.code,f.title,f.file_type,f.file_kinds,f.item_count,
+                      f.catalog,f.tags,f.is_favorite,f.created_at
                FROM files f JOIN users u ON u.id=f.user_id
                WHERE u.telegram_id=$1 AND f.deleted_at IS NULL ORDER BY f.created_at""",
             telegram_id,
@@ -806,6 +1028,7 @@ router.callback_query.outer_middleware(bot_rate_limiter)
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📥 Saqlash"), KeyboardButton(text="🔎 Qidirish")],
+        [KeyboardButton(text="📚 Barcha saqlanganlar")],
         [KeyboardButton(text="🗂 Kataloglar"), KeyboardButton(text="🏷 Teglar")],
         [KeyboardButton(text="🔢 Kod bo‘yicha"), KeyboardButton(text="🕘 Oxirgilari")],
         [KeyboardButton(text="⭐ Sevimlilar"), KeyboardButton(text="⚙️ Sozlamalar")],
@@ -836,6 +1059,12 @@ def ikb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 def file_emoji(file_type: str) -> str:
     return {
+        "image": "🖼",
+        "pdf": "📕",
+        "word": "📘",
+        "excel": "📗",
+        "other": "📦",
+        "collection": "🗃",
         "document": "📄",
         "photo": "🖼",
         "video": "🎥",
@@ -849,6 +1078,22 @@ def file_emoji(file_type: str) -> str:
         "location": "📍",
         "venue": "📍",
     }.get(file_type, "📦")
+
+
+def record_value(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, TypeError):
+        return default
+
+
+def row_file_kinds(row: Any) -> list[str]:
+    kinds = record_value(row, "file_kinds")
+    return list(kinds or [row["file_type"]])
+
+
+def kinds_text(kinds: list[str]) -> str:
+    return ", ".join(file_kind_label(kind) for kind in kinds) or "Boshqa fayl"
 
 
 def file_actions(file_id: Any, favorite: bool = False) -> InlineKeyboardMarkup:
@@ -868,9 +1113,13 @@ def file_actions(file_id: Any, favorite: bool = False) -> InlineKeyboardMarkup:
 def file_card(row: asyncpg.Record) -> str:
     tags = " ".join(f"#{esc(tag)}" for tag in (row["tags"] or [])) or "yo‘q"
     created = row["created_at"].astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    item_count = int(record_value(row, "item_count", 1))
+    type_line = kinds_text(row_file_kinds(row))
     return (
         f"{file_emoji(row['file_type'])} <b>{esc(row['title'])}</b>\n\n"
         f"🔢 Kod: <code>{esc(row['code'])}</code>\n"
+        f"🧩 Turi: {esc(type_line)}\n"
+        f"📦 Tarkib: {item_count} ta\n"
         f"🗂 Katalog: {esc(row['catalog'])}\n"
         f"🏷 Teglar: {tags}\n"
         f"📅 {created}"
@@ -941,13 +1190,67 @@ async def show_files(
     await message.answer(f"{title} — jami {total} ta:", reply_markup=ikb(buttons))
 
 
+INVENTORY_PAGE_SIZE = 20
+
+
+def inventory_page_text(rows: list[Any], total: int, page: int, pages: int) -> str:
+    lines = [f"📚 <b>Barcha saqlanganlar</b> · {total} ta · {page}/{pages}\n"]
+    for position, row in enumerate(rows, start=(page - 1) * INVENTORY_PAGE_SIZE + 1):
+        tags = " ".join(f"#{esc(tag)}" for tag in (row["tags"] or [])[:3]) or "tegsiz"
+        title = clean_title(str(row["title"]), "Nomsiz")[:55]
+        item_count = int(record_value(row, "item_count", 1))
+        count = f" · {item_count} ta" if item_count > 1 else ""
+        lines.append(
+            f"{position}. {file_emoji(row['file_type'])} <b>{esc(title)}</b> · "
+            f"<code>{esc(row['code'])}</code>\n"
+            f"   {esc(kinds_text(row_file_kinds(row)))}{count} · {tags}"
+        )
+    return "\n".join(lines)
+
+
+async def show_inventory(
+    message: Message, telegram_id: int, page: int = 1, *, edit: bool = False
+) -> None:
+    rows, total = await db.files_page(telegram_id, page=page, limit=INVENTORY_PAGE_SIZE)
+    if not rows:
+        await message.answer("📭 Hozircha saqlangan fayllar yo‘q.")
+        return
+    pages = max(1, (total + INVENTORY_PAGE_SIZE - 1) // INVENTORY_PAGE_SIZE)
+    page = min(page, pages)
+    buttons = [
+        [(f"{index}. {str(row['title'])[:32]}", f"f:open:{row['id']}")]
+        for index, row in enumerate(rows, start=(page - 1) * INVENTORY_PAGE_SIZE + 1)
+    ]
+    navigation: list[tuple[str, str]] = []
+    if page > 1:
+        navigation.append(("⬅️ Oldingi", f"inventory:{page - 1}"))
+    if page < pages:
+        navigation.append(("Keyingi ➡️", f"inventory:{page + 1}"))
+    if navigation:
+        buttons.append(navigation)
+    text = inventory_page_text(rows, total, page, pages)
+    markup = ikb(buttons)
+    if edit:
+        await message.edit_text(text, reply_markup=markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+
 async def send_stored_file(chat_id: int, row: asyncpg.Record) -> bool:
     try:
-        await bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=row["telegram_channel_id"],
-            message_id=row["channel_message_id"],
-        )
+        message_ids = list(row["channel_message_ids"] or [row["channel_message_id"]])
+        if len(message_ids) == 1:
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=row["telegram_channel_id"],
+                message_id=message_ids[0],
+            )
+        else:
+            await bot.copy_messages(
+                chat_id=chat_id,
+                from_chat_id=row["telegram_channel_id"],
+                message_ids=message_ids,
+            )
         return True
     except (TelegramBadRequest, TelegramForbiddenError):
         await db.update_file(chat_id, str(row["id"]), "is_missing", True)
@@ -958,7 +1261,9 @@ async def send_stored_file(chat_id: int, row: asyncpg.Record) -> bool:
         return False
 
 
-async def save_message(message: Message) -> None:
+async def save_messages(messages: list[Message]) -> None:
+    messages = sorted(messages, key=lambda item: item.message_id)
+    message = messages[0]
     user = await actor_user(message)
     if not user:
         return
@@ -979,49 +1284,129 @@ async def save_message(message: Message) -> None:
             "⚠️ Katalog bazasi vaqtincha ishlamayapti. Fayl saqlanmadi; keyinroq qayta yuboring."
         )
         return
-    file_type, title, unique_id, size = content_metadata(message)
+    parts = [content_metadata(item) for item in messages]
+    title = collection_title(messages, parts)
+    copied_ids: list[int] = []
     try:
-        copied = await bot.copy_message(
-            chat_id=storage["telegram_channel_id"],
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
+        if len(messages) == 1:
+            copied = await bot.copy_message(
+                chat_id=storage["telegram_channel_id"],
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            copied_ids = [copied.message_id]
+        else:
+            copied = await bot.copy_messages(
+                chat_id=storage["telegram_channel_id"],
+                from_chat_id=message.chat.id,
+                message_ids=[item.message_id for item in messages],
+            )
+            copied_ids = [item.message_id for item in copied]
     except (TelegramBadRequest, TelegramForbiddenError):
         await db.mark_channel_inactive(message.from_user.id)
         await message.answer(
             "⚠️ Kanal bilan aloqa uzildi. Botni kanalga qayta admin qilib, kanalni qayta ulang."
         )
         return
-    try:
-        row = await db.create_file(
-            message.from_user.id, copied.message_id, title, file_type, unique_id, size
+    if len(copied_ids) != len(parts):
+        log.error(
+            "Telegram copied %s of %s grouped messages", len(copied_ids), len(parts)
         )
+        for copied_id in copied_ids:
+            try:
+                await bot.delete_message(storage["telegram_channel_id"], copied_id)
+            except Exception:  # noqa: BLE001 - rollback is best effort
+                log.warning(
+                    "Incomplete group rollback failed for channel_message_id=%s",
+                    copied_id,
+                )
+        await message.answer(
+            "⚠️ Fayllar to‘plamini to‘liq nusxalab bo‘lmadi. Qayta urinib ko‘ring."
+        )
+        return
+    for part, copied_id in zip(parts, copied_ids, strict=True):
+        part["channel_message_id"] = copied_id
+    try:
+        row = await db.create_file(message.from_user.id, title, parts)
     except Exception:
         log.exception("File index insert failed; attempting orphan cleanup")
-        try:
-            await bot.delete_message(storage["telegram_channel_id"], copied.message_id)
-        except Exception:  # noqa: BLE001 - cleanup failure must not hide the original DB failure
-            log.warning(
-                "Orphan cleanup failed for channel_message_id=%s", copied.message_id
-            )
+        for copied_id in copied_ids:
+            try:
+                await bot.delete_message(storage["telegram_channel_id"], copied_id)
+            except Exception:  # noqa: BLE001 - cleanup failure must not hide the original DB failure
+                log.warning(
+                    "Orphan cleanup failed for channel_message_id=%s", copied_id
+                )
         await message.answer(
             "⚠️ Indeksni yaratib bo‘lmadi. Operatsiya bekor qilindi; qayta urinib ko‘ring."
         )
         return
     if storage["index_message_enabled"]:
         tags = " ".join(f"#T_{tag}" for tag in row["tags"])
+        type_summary = kinds_text(row_file_kinds(row))
         try:
             await bot.send_message(
                 storage["telegram_channel_id"],
-                f"🗂 KEEPGRAM INDEX\n#C_{row['code']}\n📝 {esc(row['title'])}\n#K_{esc(row['catalog'])} {tags}",
+                f"🗂 KEEPGRAM INDEX\n#C_{row['code']}\n📝 {esc(row['title'])}\n"
+                f"🧩 {esc(type_summary)} · {row['item_count']} ta\n"
+                f"#K_{esc(row['catalog'])} {tags}",
             )
         except Exception:  # noqa: BLE001 - optional index must never fail a successful save
             log.warning("Optional channel index message failed")
     await message.answer(
         f"✅ <b>Saqlandi</b>\n\n📝 {esc(row['title'])}\n🔢 Kod: <code>{row['code']}</code>\n"
+        f"🧩 Turi: {esc(kinds_text(row_file_kinds(row)))}\n📦 Tarkib: {row['item_count']} ta\n"
         f"🗂 Katalog: {esc(row['catalog'])}\n🏷 Teglar: yo‘q",
         reply_markup=file_actions(row["id"], row["is_favorite"]),
     )
+
+
+MEDIA_GROUP_SETTLE_SECONDS = 1.2
+album_buffers: dict[tuple[int, str], list[Message]] = {}
+album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
+album_lock = asyncio.Lock()
+
+
+async def flush_media_group(key: tuple[int, str]) -> None:
+    messages: list[Message] = []
+    try:
+        await asyncio.sleep(MEDIA_GROUP_SETTLE_SECONDS)
+        async with album_lock:
+            if album_tasks.get(key) is not asyncio.current_task():
+                return
+            messages = album_buffers.pop(key, [])
+            album_tasks.pop(key, None)
+        if messages:
+            await save_messages(messages)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        log.exception("Media group save failed")
+        messages = messages or album_buffers.pop(key, [])
+        album_tasks.pop(key, None)
+        if messages:
+            await messages[0].answer(
+                "⚠️ Fayllar to‘plamini saqlashda xatolik. Qayta urinib ko‘ring."
+            )
+
+
+async def queue_media_group(message: Message) -> None:
+    key = (message.from_user.id, str(message.media_group_id))
+    async with album_lock:
+        buffered = album_buffers.setdefault(key, [])
+        if all(item.message_id != message.message_id for item in buffered):
+            buffered.append(message)
+        previous = album_tasks.get(key)
+        if previous:
+            previous.cancel()
+        album_tasks[key] = asyncio.create_task(flush_media_group(key))
+
+
+async def save_message(message: Message) -> None:
+    if message.media_group_id:
+        await queue_media_group(message)
+        return
+    await save_messages([message])
 
 
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
@@ -1112,10 +1497,10 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "<b>KeepGram yordam</b>\n\n"
         "1. /channel orqali shaxsiy kanalingizni ulang.\n"
-        "2. Fayl, rasm, video yoki audioni botga yuboring.\n"
+        "2. Fayl, rasm, video yoki audioni botga yuboring. Bir martada tanlangan albom bitta to‘plam bo‘lib saqlanadi.\n"
         "3. Bot bergan 6 belgili kodni saqlab qo‘ying.\n"
         "4. Kodni yuboring yoki 🔎 Qidirish orqali faylni toping.\n\n"
-        "/recent — oxirgilari\n/catalogs — kataloglar\n/tags — teglar\n/settings — sozlamalar\n"
+        "/recent — oxirgilari\n/all — barcha saqlanganlar menyusi\n/catalogs — kataloglar\n/tags — teglar\n/settings — sozlamalar\n"
         "/mydata — saqlangan metadata\n/delete_my_data — metadata hisobini o‘chirish\n/privacy — maxfiylik\n/cancel — amalni bekor qilish"
     )
 
@@ -1349,7 +1734,8 @@ async def begin_save(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(Flow.save_text)
     await message.answer(
-        "Fayl, rasm, video, audio yoki saqlamoqchi bo‘lgan matnni yuboring. /cancel — bekor qilish."
+        "Fayl, rasm, video, audio yoki saqlamoqchi bo‘lgan matnni yuboring. "
+        "Bir martada bir nechta fayl tanlasangiz, ular bitta to‘plam bo‘lib saqlanadi. /cancel — bekor qilish."
     )
 
 
@@ -1437,6 +1823,27 @@ async def recent_files(message: Message) -> None:
     await show_files(message)
 
 
+@router.message(Command("all"), F.chat.type == ChatType.PRIVATE)
+@router.message(F.text == "📚 Barcha saqlanganlar", F.chat.type == ChatType.PRIVATE)
+async def all_files_inventory(message: Message) -> None:
+    if not await actor_user(message):
+        return
+    await show_inventory(message, message.from_user.id)
+
+
+@router.callback_query(F.data.startswith("inventory:"))
+async def inventory_callback(callback: CallbackQuery) -> None:
+    if not await actor_user(callback):
+        return
+    try:
+        page = max(1, int(callback.data.split(":", 1)[1]))
+    except ValueError:
+        await callback.answer("Noto‘g‘ri sahifa", show_alert=True)
+        return
+    await callback.answer()
+    await show_inventory(callback.message, callback.from_user.id, page, edit=True)
+
+
 @router.message(F.text == "⭐ Sevimlilar", F.chat.type == ChatType.PRIVATE)
 async def favorite_files(message: Message) -> None:
     if not await actor_user(message):
@@ -1511,7 +1918,9 @@ async def rename_finish(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     row = await db.update_file(message.from_user.id, data["file_id"], "title", title)
     await state.clear()
-    await message.answer("✅ Nomi yangilandi." if row else "Fayl topilmadi.")
+    await message.answer(
+        f"✅ Nomi yangilandi: <b>{esc(row['title'])}</b>" if row else "Fayl topilmadi."
+    )
 
 
 @router.callback_query(F.data.startswith("f:tag:"))
@@ -1609,17 +2018,19 @@ async def delete_all(callback: CallbackQuery) -> None:
     if not row:
         await callback.answer("Topilmadi", show_alert=True)
         return
-    try:
-        await bot.delete_message(row["telegram_channel_id"], row["channel_message_id"])
-    except TelegramBadRequest as exc:
-        if "message to delete not found" not in str(exc).lower():
-            await callback.answer(
-                "Botda o‘chirish huquqi yo‘q yoki Telegram rad etdi.", show_alert=True
-            )
+    for message_id in list(row["channel_message_ids"] or [row["channel_message_id"]]):
+        try:
+            await bot.delete_message(row["telegram_channel_id"], message_id)
+        except TelegramBadRequest as exc:
+            if "message to delete not found" not in str(exc).lower():
+                await callback.answer(
+                    "Botda o‘chirish huquqi yo‘q yoki Telegram rad etdi.",
+                    show_alert=True,
+                )
+                return
+        except TelegramForbiddenError:
+            await callback.answer("Bot kanalda admin emas.", show_alert=True)
             return
-    except TelegramForbiddenError:
-        await callback.answer("Bot kanalda admin emas.", show_alert=True)
-        return
     await db.delete_file(callback.from_user.id, file_id)
     await callback.answer("Kanal va indeksdan o‘chirildi", show_alert=True)
 
@@ -2146,6 +2557,7 @@ async def lifespan(_: FastAPI):
             BotCommand(command="menu", description="Asosiy menyu"),
             BotCommand(command="search", description="Fayl qidirish"),
             BotCommand(command="recent", description="Oxirgi fayllar"),
+            BotCommand(command="all", description="Barcha saqlanganlar"),
             BotCommand(command="catalogs", description="Kataloglar"),
             BotCommand(command="tags", description="Teglar"),
             BotCommand(command="settings", description="Sozlamalar"),
@@ -2167,6 +2579,9 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        pending_albums = list(album_tasks.values())
+        if pending_albums:
+            await asyncio.gather(*pending_albums, return_exceptions=True)
         await bot.session.close()
         await db.close()
 
@@ -2339,7 +2754,7 @@ async def admin_stats(_: str = Depends(session_admin)) -> dict[str, Any]:
     row = await db.ready().fetchrow(
         """SELECT (SELECT count(*) FROM users)::int users,
                   (SELECT count(*) FROM storage_channels WHERE is_active)::int channels,
-                  (SELECT count(*) FROM files WHERE deleted_at IS NULL)::int files,
+                  (SELECT COALESCE(sum(item_count),0) FROM files WHERE deleted_at IS NULL)::int files,
                   (SELECT count(*) FROM users WHERE last_seen_at>now()-interval '24 hours')::int active_24h,
                   (SELECT count(*) FROM users WHERE is_blocked)::int blocked"""
     )
@@ -2348,7 +2763,7 @@ async def admin_stats(_: str = Depends(session_admin)) -> dict[str, Any]:
                   created_at FROM users ORDER BY created_at DESC LIMIT 7"""
     )
     recent_files = await db.ready().fetch(
-        "SELECT title,code,file_type,created_at FROM files WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 7"
+        "SELECT title,code,file_type,file_kinds,item_count,created_at FROM files WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 7"
     )
     return {
         **jsonable(row),
@@ -2375,7 +2790,7 @@ async def admin_users(
         f"""SELECT u.id,u.telegram_id,u.username,COALESCE(u.display_name,u.first_name) AS first_name,
                    u.last_name,u.phone,u.onboarding_completed,u.is_blocked,
                    u.created_at,u.last_seen_at,s.channel_title,s.telegram_channel_id,
-                   count(f.id) FILTER(WHERE f.deleted_at IS NULL)::int file_count
+                   COALESCE(sum(f.item_count) FILTER(WHERE f.deleted_at IS NULL),0)::int file_count
             FROM users u LEFT JOIN storage_channels s ON s.user_id=u.id
             LEFT JOIN files f ON f.user_id=u.id WHERE {where}
             GROUP BY u.id,s.id ORDER BY u.created_at DESC LIMIT $2 OFFSET $3""",
@@ -2392,7 +2807,7 @@ async def admin_user_detail(
 ) -> dict[str, Any]:
     user = await db.ready().fetchrow(
         """SELECT u.*,s.telegram_channel_id,s.channel_title,s.channel_username,s.is_active,s.linked_at,
-                  count(f.id) FILTER(WHERE f.deleted_at IS NULL)::int file_count,
+                  COALESCE(sum(f.item_count) FILTER(WHERE f.deleted_at IS NULL),0)::int file_count,
                   count(f.id) FILTER(WHERE f.is_favorite AND f.deleted_at IS NULL)::int favorite_count
            FROM users u LEFT JOIN storage_channels s ON s.user_id=u.id LEFT JOIN files f ON f.user_id=u.id
            WHERE u.id=$1 GROUP BY u.id,s.id""",
@@ -2401,7 +2816,8 @@ async def admin_user_detail(
     if not user:
         raise HTTPException(404, "Foydalanuvchi topilmadi")
     files = await db.ready().fetch(
-        """SELECT id,title,code,file_type,catalog,tags,is_favorite,is_missing,channel_message_id,created_at
+        """SELECT id,title,code,file_type,file_kinds,item_count,catalog,tags,
+                  is_favorite,is_missing,channel_message_id,created_at
            FROM files WHERE user_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 100""",
         user_id,
     )
@@ -2458,7 +2874,7 @@ async def admin_channels(
     total = await db.ready().fetchval("SELECT count(*) FROM storage_channels")
     rows = await db.ready().fetch(
         """SELECT s.id,s.telegram_channel_id,s.channel_title,s.channel_username,s.is_active,s.linked_at,
-                  u.telegram_id,u.username,count(f.id)::int file_count
+                  u.telegram_id,u.username,COALESCE(sum(f.item_count),0)::int file_count
            FROM storage_channels s JOIN users u ON u.id=s.user_id LEFT JOIN files f ON f.channel_id=s.id
            GROUP BY s.id,u.id ORDER BY s.linked_at DESC LIMIT $1 OFFSET $2""",
         limit,
@@ -2493,7 +2909,8 @@ async def admin_files(
         search,
     )
     rows = await db.ready().fetch(
-        f"""SELECT f.id,f.title,f.code,f.file_type,f.catalog,f.tags,f.is_favorite,f.is_missing,
+        f"""SELECT f.id,f.title,f.code,f.file_type,f.file_kinds,f.item_count,
+                   f.catalog,f.tags,f.is_favorite,f.is_missing,
                    f.channel_message_id,f.created_at,u.telegram_id,u.username,s.channel_title
             FROM files f JOIN users u ON u.id=f.user_id JOIN storage_channels s ON s.id=f.channel_id
             WHERE f.deleted_at IS NULL AND ({where}) ORDER BY f.created_at DESC LIMIT $2 OFFSET $3""",

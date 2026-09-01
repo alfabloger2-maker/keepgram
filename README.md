@@ -1,12 +1,16 @@
 # KeepGram
 
-KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifatida ishlatadigan bot. Bot fayl baytlarini Render serveriga yuklamaydi: xabarni Telegram ichida `copyMessage` bilan kanalga nusxalaydi va Supabase PostgreSQL’da faqat kichik indeks metadata saqlaydi.
+KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifatida ishlatadigan bot. Bot fayl baytlarini Render serveriga yuklamaydi: xabarlarni Telegram ichida `copyMessage/copyMessages` bilan kanalga nusxalaydi va Supabase PostgreSQL’da faqat kichik indeks metadata saqlaydi.
 
 ## Tayyor imkoniyatlar
 
 - bir foydalanuvchi = bitta kanal, bir kanal = bitta foydalanuvchi;
 - 15 daqiqalik bir martalik `LINK-XXXXXXXX` token bilan xavfsiz kanal ulash;
 - document, photo, video, audio, voice, GIF, sticker, video-note, kontakt, lokatsiya va matn saqlash;
+- bir martada yuborilgan 2–10 ta media/faylni bitta kodli to‘plam sifatida saqlash va qaytarish;
+- JPG/PNG va boshqa rasmlar, PDF, Word, Excel hamda boshqa fayllarni avtomatik turkumlash;
+- takrorlangan nomlarni avtomatik `Nomi (2)`, `Nomi (3)` ko‘rinishida noyob qilish;
+- nom, kod, tur va teglar ko‘rinadigan ixcham “Barcha saqlanganlar” menyusi;
 - fayl serverga yuklanmasdan Telegram ichida nusxalanishi;
 - chalkash belgilar olib tashlangan 6 belgili kod;
 - kod, nom, teg va katalog bo‘yicha owner-scoped qidiruv;
@@ -138,12 +142,12 @@ Texnik haqiqat: bot tokeniga ega operator bot admin bo‘lgan kanallarda Telegra
 - Supabase bazasi indeksdir. Uni yo‘qotsangiz, Telegram kanaldagi fayllar qoladi, lekin KeepGram eski kod va qidiruv bilan ularni topolmaydi. Database backup yoqing.
 - Foydalanuvchi faylni kanaldan qo‘lda o‘chirsa, keyingi olishda KeepGram indeksni `missing` deb belgilaydi.
 - Kanal almashtirilganda eski kanal fayllari qoladi, eski kanalga tegishli indeks tozalanadi.
-- Memory FSM faqat juda qisqa rename/tag/qidiruv dialoglari uchun ishlatiladi; media kelishi bilan darhol saqlanadi.
+- Memory FSM faqat juda qisqa rename/tag/qidiruv dialoglari uchun ishlatiladi; media albomi qismlari 1,2 soniya yig‘ilib, keyin bitta indeks sifatida saqlanadi.
 - `/health` endpoint Render health-check uchun, `/ping` esa tashqi uptime tekshiruvi uchun tayyor.
 
 ## Asosiy buyruqlar
 
-`/start`, `/menu`, `/search`, `/recent`, `/catalogs`, `/tags`, `/settings`, `/channel`, `/disconnect`, `/mydata`, `/delete_my_data`, `/privacy`, `/help`, `/cancel`, `/admin`.
+`/start`, `/menu`, `/search`, `/recent`, `/all`, `/catalogs`, `/tags`, `/settings`, `/channel`, `/disconnect`, `/mydata`, `/delete_my_data`, `/privacy`, `/help`, `/cancel`, `/admin`.
 
 ## Litsenziya va foydalanish
 
