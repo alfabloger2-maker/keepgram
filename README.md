@@ -12,7 +12,7 @@ KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifat
 - kod, nom, teg va katalog bo‘yicha owner-scoped qidiruv;
 - kataloglar, teglar, sevimlilar, oxirgi fayllar, nomni tahrirlash;
 - faqat indeksdan yoki kanal va indeksdan o‘chirish;
-- ixtiyoriy telefon ulash, JSON metadata eksporti va foydalanuvchi metadata hisobini o‘chirish;
+- majburiy ism va Telegram kontakt onboarding, JSON metadata eksporti va foydalanuvchi metadata hisobini o‘chirish;
 - metadata-only responsive admin panel, bloklash/ochish, kanal uzish va audit jurnali;
 - Telegram secret header bilan himoyalangan webhook, HttpOnly admin sessiyasi, CSRF, login rate-limit va xavfsizlik headerlari;
 - GitHub commitidan Render auto-deploy va avtomatik Telegram webhook sozlash.
@@ -51,17 +51,14 @@ KeepGram Supabase browser SDK’dan foydalanmaydi. `DATABASE_URL` faqat server e
 
 ## 3. Maxfiy qiymatlarni yaratish
 
-Avval `bcrypt` o‘rnating:
+Admin parolini Render Environment bo‘limida oddiy ko‘rinishda kiriting. Masalan:
 
-```powershell
-python -m pip install bcrypt
+```env
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=1111
 ```
 
-Admin parolini terminal tarixiga yozmasdan bcrypt hash yarating:
-
-```powershell
-python -c "import bcrypt,getpass; print(bcrypt.hashpw(getpass.getpass('Admin parol: ').encode(), bcrypt.gensalt(12)).decode())"
-```
+`1111` ishlaydi, lekin haqiqiy bot uchun uzun va taxmin qilish qiyin parol tanlash tavsiya etiladi. Parolni `.env` fayli bilan GitHub’ga yuklamang.
 
 Webhook va session kalitlarini yarating:
 
@@ -95,7 +92,7 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 | `BOT_TOKEN` | BotFather tokeni |
 | `DATABASE_URL` | Supabase PostgreSQL URI |
 | `APP_BASE_URL` | Render bergan to‘liq HTTPS URL, masalan `https://keepgram-abcd.onrender.com` |
-| `ADMIN_PASSWORD_HASH` | Yuqorida yaratilgan bcrypt hash |
+| `ADMIN_PASSWORD` | Admin panelga kirish uchun oddiy parol (masalan, `1111`) |
 | `ADMIN_TELEGRAM_IDS` | Ixtiyoriy, `/admin` buyrug‘i uchun IDlar: `123,456` |
 
 `WEBHOOK_SECRET` va `SESSION_SECRET` Blueprint tomonidan avtomatik yaratiladi. Agar servisni Blueprint’siz qo‘lda yaratsangiz, ularni ham o‘zingiz kiriting.
@@ -103,6 +100,8 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 5. Deploy tugagach `https://SIZNING-SERVIS.onrender.com/health` manzilida `status: ok`, `database: true` va `schema: true` ko‘rinishi kerak.
 6. Botga `/start` yuboring. Webhook ilova ishga tushganida avtomatik o‘rnatiladi.
 7. Admin panel: `https://SIZNING-SERVIS.onrender.com/admin`.
+
+Admin panelga faqat aynan `/admin` manzili orqali kiring. `/admin/...` ko‘rinishidagi noma’lum yo‘llar yopiq. Login — `ADMIN_USERNAME`, parol — Render Environment’dagi `ADMIN_PASSWORD` qiymati. Login doim 401 qaytarsa, Render’dagi ikkala qiymatni tekshiring, saqlang va servisni qayta deploy qiling.
 
 Keyingi GitHub commitlari Render’da avtomatik deploy bo‘ladi.
 
@@ -116,6 +115,10 @@ Keyingi GitHub commitlari Render’da avtomatik deploy bo‘ladi.
 
 Token usuli forward metadata cheklovlariga bog‘liq emas. Tokenni bilgan odam kanalga yoza olishi va botni admin qila olishi kerak; token 15 daqiqada eskiradi va muvaffaqiyatli ulanishdan keyin darhol o‘chadi.
 
+## Majburiy ro‘yxatdan o‘tish
+
+Yangi foydalanuvchi `/start` yuborganda KeepGram avval foydalanuvchi kiritgan ismni, keyin Telegram `request_contact` tugmasi orqali aynan o‘z telefon raqamini oladi. Begona kontakt va qo‘lda yozilgan telefon qabul qilinmaydi. Ism hamda tasdiqlangan telefon saqlanmaguncha botning kanal, fayl, qidiruv va sozlamalar funksiyalari ochilmaydi.
+
 ## Xavfsizlik va maxfiylik
 
 - Har bir file query `telegram_id/user_id` bilan owner-scoped; callback ichidagi user ID’ga ishonilmaydi.
@@ -125,6 +128,7 @@ Token usuli forward metadata cheklovlariga bog‘liq emas. Tokenni bilgan odam k
 - Kanalda bot huquqi yo‘qolsa storage `inactive` bo‘ladi; foydalanuvchi qayta ulaydi.
 - `schema.sql` anon/authenticated rollardan jadvallarni yopadi. Admin UI faqat FastAPI orqali ishlaydi.
 - Admin session cookie production’da `Secure`, `HttpOnly`, `SameSite=Lax`; mutatsiyalar CSRF header bilan himoyalangan.
+- Admin sessiyasi imzolangan cookie va brauzer fingerprintiga bog‘langan; noma’lum `/admin/...` yo‘llari yopiq.
 - Loglarga tokenlar, fayl kontenti va foydalanuvchi xabar matni yozilmaydi.
 
 Texnik haqiqat: bot tokeniga ega operator bot admin bo‘lgan kanallarda Telegram API orqali amal bajarish imkoniga ega bo‘lishi mumkin. Shu sabab bot tokeni qat’iy himoyalanishi, admin panel esa metadata-only bo‘lib qolishi kerak.

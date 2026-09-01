@@ -10,12 +10,20 @@ create table if not exists users (
   username text,
   first_name text,
   last_name text,
+  display_name text,
   phone text,
   language_code text,
+  onboarding_completed boolean not null default false,
+  onboarded_at timestamptz,
   is_blocked boolean not null default false,
   created_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now()
 );
+
+-- Existing KeepGram databases are upgraded idempotently on every app startup.
+alter table users add column if not exists display_name text;
+alter table users add column if not exists onboarding_completed boolean not null default false;
+alter table users add column if not exists onboarded_at timestamptz;
 
 create table if not exists storage_channels (
   id uuid primary key default gen_random_uuid(),

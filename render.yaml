@@ -26,10 +26,9 @@ services:
         generateValue: true
       - key: ADMIN_USERNAME
         value: admin
-      - key: ADMIN_PASSWORD_HASH
+      - key: ADMIN_PASSWORD
         sync: false
       - key: SESSION_SECRET
         generateValue: true
       - key: ADMIN_TELEGRAM_IDS
         sync: false
-

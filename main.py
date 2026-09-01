@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 import asyncpg
-import bcrypt
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -75,7 +74,7 @@ class Settings(BaseSettings):
     app_base_url: str
     webhook_secret: SecretStr
     admin_username: str = "admin"
-    admin_password_hash: SecretStr
+    admin_password: SecretStr
     admin_telegram_ids: str = ""
     session_secret: SecretStr
     app_env: str = "production"
@@ -108,18 +107,12 @@ class Settings(BaseSettings):
             raise ValueError("ADMIN_USERNAME 3-64 belgi bo‘lishi kerak")
         return value
 
-    @field_validator("admin_password_hash")
+    @field_validator("admin_password")
     @classmethod
-    def validate_admin_password_hash(cls, value: SecretStr) -> SecretStr:
-        raw = value.get_secret_value().strip()
-        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
-            raw = raw[1:-1].strip()
-        try:
-            bcrypt.checkpw(b"keepgram-hash-validation", raw.encode("utf-8"))
-        except ValueError as exc:
-            raise ValueError(
-                "ADMIN_PASSWORD_HASH yaroqli bcrypt hash emas; oddiy parolni bu yerga yozmang"
-            ) from exc
+    def validate_admin_password(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value()
+        if not 4 <= len(raw) <= 128:
+            raise ValueError("ADMIN_PASSWORD uzunligi 4-128 ta belgi bo‘lsin")
         return SecretStr(raw)
 
     @field_validator("session_secret")
@@ -2280,14 +2273,10 @@ async def admin_login(body: LoginBody, request: Request) -> dict[str, Any]:
         raise HTTPException(429, "10 daqiqada juda ko‘p noto‘g‘ri urinish")
     submitted_username = body.username.strip()
     username_ok = hmac.compare_digest(submitted_username, settings.admin_username)
-    try:
-        password_ok = bcrypt.checkpw(
-            body.password.encode(),
-            settings.admin_password_hash.get_secret_value().encode(),
-        )
-    except ValueError:
-        log.error("ADMIN_PASSWORD_HASH yaroqsiz bcrypt hash")
-        password_ok = False
+    password_ok = hmac.compare_digest(
+        body.password.encode("utf-8"),
+        settings.admin_password.get_secret_value().encode("utf-8"),
+    )
     if not username_ok or not password_ok:
         attempts.append(now)
         login_attempts[ip] = attempts

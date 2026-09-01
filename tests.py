@@ -1,21 +1,23 @@
 import os
 import unittest
+from pathlib import Path
 from uuid import uuid4
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost:5432/test")
 os.environ.setdefault("APP_BASE_URL", "https://example.com")
 os.environ.setdefault("WEBHOOK_SECRET", "abcdefghijklmnop")
-os.environ.setdefault(
-    "ADMIN_PASSWORD_HASH",
-    "$2b$12$00000000000000000000000000000000000000000000000000000",
-)
+os.environ.setdefault("ADMIN_PASSWORD", "test-password")
 os.environ.setdefault("SESSION_SECRET", "01234567890123456789012345678901")
 
 import main
 
 
 class KeepGramCoreTests(unittest.TestCase):
+    def test_plain_admin_password_accepts_four_characters(self):
+        configured = main.Settings(admin_password="1111")
+        self.assertEqual(configured.admin_password.get_secret_value(), "1111")
+
     def test_codes_have_safe_six_character_alphabet(self):
         for _ in range(500):
             code = main.make_code()
@@ -47,6 +49,13 @@ class KeepGramCoreTests(unittest.TestCase):
         self.assertIn("/health", paths)
         self.assertIn("/telegram/webhook", paths)
         self.assertIn("/admin", paths)
+        self.assertIn("/admin/{unexpected_path:path}", paths)
+        self.assertIn("/api/admin/session", paths)
+
+    def test_schema_contains_mandatory_onboarding_fields(self):
+        schema = Path("schema.sql").read_text(encoding="utf-8")
+        self.assertIn("display_name text", schema)
+        self.assertIn("onboarding_completed boolean not null default false", schema)
 
 
 if __name__ == "__main__":
