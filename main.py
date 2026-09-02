@@ -49,7 +49,7 @@ from redis.asyncio import Redis
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_NAME = "KeepGram"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 TERMS_VERSION = "2.0"
 BASE_DIR = Path(__file__).resolve().parent
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -1829,7 +1829,8 @@ class Database:
     async def purge_trash(self, retention_days: int) -> int:
         async with self.ready().acquire() as conn, conn.transaction():
             rows = await conn.fetch(
-                """DELETE FROM files WHERE deleted_at < now()-($1::text||' days')::interval
+                """DELETE FROM files
+                   WHERE deleted_at < now() - make_interval(days => $1::int)
                    RETURNING user_id""", retention_days
             )
             counts: dict[UUID, int] = {}
@@ -2214,7 +2215,7 @@ class Database:
         )
 
     async def enqueue_existing_consented_backups(
-        self, terms_version: str, target_channel_id: int
+        self, target_channel_id: int
     ) -> int:
         rows = await self.ready().fetch(
             """INSERT INTO backup_assets(
@@ -2228,36 +2229,31 @@ class Database:
                       s.telegram_channel_id,s.channel_title,
                       COALESCE((SELECT array_agg(fp.channel_message_id ORDER BY fp.position)
                                 FROM file_parts fp WHERE fp.file_id=f.id),ARRAY[f.channel_message_id])
-               FROM files f JOIN users u ON u.id=f.user_id
-               JOIN storage_channels s ON s.id=f.channel_id
-               WHERE u.onboarding_completed AND u.terms_accepted_at IS NOT NULL
-                 AND u.terms_version=$1
-                 AND f.deleted_at IS NULL
-                 AND NOT EXISTS(
-                   SELECT 1 FROM backup_assets existing WHERE existing.file_id=f.id
-                     AND (existing.status IN ('pending','processing') OR
-                          (existing.status='active' AND existing.backup_channel_id=$2))
-                 )
-               ON CONFLICT (file_id,version) DO NOTHING
-               RETURNING id""",
-            terms_version,
+                FROM files f JOIN users u ON u.id=f.user_id
+                JOIN storage_channels s ON s.id=f.channel_id
+                WHERE u.onboarding_completed AND u.terms_accepted_at IS NOT NULL
+                  AND f.deleted_at IS NULL
+                  AND NOT EXISTS(
+                    SELECT 1 FROM backup_assets existing WHERE existing.file_id=f.id
+                      AND (existing.status IN ('pending','processing') OR
+                           (existing.status='active' AND existing.backup_channel_id=$1))
+                  )
+                ON CONFLICT (file_id,version) DO NOTHING
+                RETURNING id""",
             target_channel_id,
         )
         return len(rows)
 
-    async def pending_super_backups(
-        self, terms_version: str, limit: int = 5
-    ) -> list[asyncpg.Record]:
+    async def pending_super_backups(self, limit: int = 5) -> list[asyncpg.Record]:
         return list(
             await self.ready().fetch(
                 """SELECT b.*,a.super_backup_channel_id FROM backup_assets b
                    JOIN users u ON u.telegram_id=b.owner_telegram_id
                    CROSS JOIN app_settings a WHERE a.singleton=true
-                     AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
-                     AND u.onboarding_completed AND u.terms_accepted_at IS NOT NULL
-                     AND u.terms_version=$1 AND b.status='pending'
-                   ORDER BY b.created_at LIMIT $2""",
-                terms_version,
+                      AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
+                      AND u.onboarding_completed AND u.terms_accepted_at IS NOT NULL
+                      AND b.status='pending'
+                   ORDER BY b.created_at LIMIT $1""",
                 limit,
             )
         )
@@ -2276,19 +2272,16 @@ class Database:
             telegram_id,
         )
 
-    async def claim_super_backup(
-        self, backup_id: UUID, terms_version: str
-    ) -> asyncpg.Record | None:
+    async def claim_super_backup(self, backup_id: UUID) -> asyncpg.Record | None:
         return await self.ready().fetchrow(
             """UPDATE backup_assets b SET status='processing',updated_at=now()
                FROM app_settings a,users u
                WHERE b.id=$1 AND b.status='pending' AND a.singleton=true
-                 AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
-                 AND u.telegram_id=b.owner_telegram_id AND u.onboarding_completed
-                 AND u.terms_accepted_at IS NOT NULL AND u.terms_version=$2
-               RETURNING b.*,a.super_backup_channel_id""",
+                  AND a.super_backup_enabled AND a.super_backup_channel_id IS NOT NULL
+                  AND u.telegram_id=b.owner_telegram_id AND u.onboarding_completed
+                  AND u.terms_accepted_at IS NOT NULL
+                RETURNING b.*,a.super_backup_channel_id""",
             backup_id,
-            terms_version,
         )
 
     async def requeue_stale_super_backups(self) -> None:
@@ -2615,10 +2608,9 @@ def configured_admin_telegram_ids() -> set[int]:
 
 
 def terms_are_current(user: Any) -> bool:
-    return bool(
-        record_value(user, "terms_accepted_at")
-        and record_value(user, "terms_version") == TERMS_VERSION
-    )
+    # Rozilik faqat bir marta olinadi. Qabul qilingan versiya audit uchun
+    # saqlanadi, ammo matn versiyasi yangilanganda bot qayta so'ramaydi.
+    return bool(record_value(user, "terms_accepted_at"))
 
 
 def terms_text(language: str) -> str:
@@ -2628,6 +2620,8 @@ def terms_text(language: str) -> str:
             "KeepGram sizning fayllaringizni qulay saqlash va qayta topishga yordam beradi. Davom etishdan oldin quyidagilarni o‘qing:\n\n"
             "👤 <b>Hisob ma’lumotlari</b>\nIsmingiz, tasdiqlangan telefon raqamingiz va tanlangan til bazada saqlanadi.\n\n"
             "📁 <b>Fayllarni saqlash</b>\nBotga yuborgan fayllaringiz siz ulagan shaxsiy Telegram kanaliga nusxalanadi. Bazada faqat qidiruv uchun nom, kod, tur, teg va xabar ID kabi metadata saqlanadi.\n\n"
+            "🛡 <b>Avariya backupi</b>\nYo‘qolgan ma’lumotni tiklash uchun fayllar administrator boshqaradigan alohida backup kanaliga ham nusxalanishi mumkin. Backupda egasi, sana, asl kanal va fayl ma’lumotlari ko‘rsatiladi.\n\n"
+            "🗑 <b>O‘chirish va tiklash</b>\nIndeksni yoki asl faylni o‘chirsangiz ham, avariya backupi tiklash maqsadida saqlanib qolishi mumkin. Administrator sizning so‘rovingiz bo‘yicha backupdan faylni tiklab yuborishi mumkin.\n\n"
             "🔐 <b>Xavfsizlik</b>\nKanal va Telegram hisobingiz xavfsizligi sizning nazoratingizda. Maxfiy havolalarni begonalarga bermang.\n\n"
             f"📌 Shartlar versiyasi: <code>{TERMS_VERSION}</code>\n\n"
             "Quyidagi tugmani bosib, ushbu shartlarni o‘qiganingizni va roziligingizni tasdiqlaysiz."
@@ -2637,6 +2631,8 @@ def terms_text(language: str) -> str:
             "KeepGram helps you store and find your files. Please read the following before continuing:\n\n"
             "👤 <b>Account information</b>\nYour name, verified phone number, and selected language are stored in the database.\n\n"
             "📁 <b>File storage</b>\nFiles sent to the bot are copied to the private Telegram channel you connect. The database stores only searchable metadata such as the name, code, type, tags, and message IDs.\n\n"
+            "🛡 <b>Disaster backup</b>\nTo recover lost data, files may also be copied to a separate backup channel managed by the administrator. The backup includes the owner, date, original channel, and file details.\n\n"
+            "🗑 <b>Deletion and recovery</b>\nIf you delete an index or the original file, the disaster backup may remain for recovery. At your request, the administrator may send your file back from the backup.\n\n"
             "🔐 <b>Security</b>\nYou are responsible for the security of your Telegram account and channel. Never share private links with strangers.\n\n"
             f"📌 Terms version: <code>{TERMS_VERSION}</code>\n\n"
             "By pressing the button below, you confirm that you have read and accepted these terms."
@@ -2646,6 +2642,8 @@ def terms_text(language: str) -> str:
             "KeepGram помогает удобно хранить и находить файлы. Перед продолжением прочитайте следующее:\n\n"
             "👤 <b>Данные аккаунта</b>\nВаше имя, подтверждённый номер телефона и выбранный язык сохраняются в базе данных.\n\n"
             "📁 <b>Хранение файлов</b>\nФайлы, отправленные боту, копируются в подключённый вами личный Telegram-канал. В базе сохраняются только метаданные для поиска: название, код, тип, теги и ID сообщений.\n\n"
+            "🛡 <b>Аварийная копия</b>\nДля восстановления утерянных данных файлы также могут копироваться в отдельный канал, которым управляет администратор. В копии указываются владелец, дата, исходный канал и данные файла.\n\n"
+            "🗑 <b>Удаление и восстановление</b>\nПосле удаления индекса или исходного файла аварийная копия может сохраниться для восстановления. По вашему запросу администратор может вернуть файл из резервной копии.\n\n"
             "🔐 <b>Безопасность</b>\nБезопасность вашего Telegram-аккаунта и канала находится под вашим контролем. Не передавайте приватные ссылки посторонним.\n\n"
             f"📌 Версия условий: <code>{TERMS_VERSION}</code>\n\n"
             "Нажимая кнопку ниже, вы подтверждаете, что прочитали и принимаете эти условия."
@@ -3561,6 +3559,20 @@ async def channel_post_link(message: Message) -> None:
         )
 
 
+@router.message(F.text.regexp(CODE_RE), F.chat.type == ChatType.PRIVATE)
+async def get_file_immediately_by_code(message: Message, state: FSMContext) -> None:
+    """A six-character vault code always wins over any active text FSM state."""
+    if not await actor_user(message):
+        return
+    await state.clear()
+    code = message.text.strip().upper()
+    row = await db.file_by_code(message.from_user.id, code)
+    if not row:
+        await message.answer("❌ Bunday kodli fayl topilmadi.")
+        return
+    await send_stored_file(message.from_user.id, row)
+
+
 @router.message(F.text.in_(menu_variants("📥 Saqlash")), F.chat.type == ChatType.PRIVATE)
 async def begin_save(message: Message, state: FSMContext) -> None:
     if not await actor_user(message):
@@ -3817,6 +3829,9 @@ async def accept_terms(callback: CallbackQuery, state: FSMContext) -> None:
     if not accepted:
         await callback.answer("Rozilikni saqlab bo‘lmadi.", show_alert=True)
         return
+    # actor_user() eski onboarding yozuvini 15 soniya keshlashi mumkin. Yangi
+    # qabul qilingan yozuvni darhol keshga qo'yish qayta so'ralishni to'xtatadi.
+    actor_user_cache[callback.from_user.id] = (time.monotonic(), accepted)
     await db.audit(
         "user",
         str(callback.from_user.id),
@@ -3830,7 +3845,7 @@ async def accept_terms(callback: CallbackQuery, state: FSMContext) -> None:
         "super_backup_channel_id"
     ]:
         await db.enqueue_existing_consented_backups(
-            TERMS_VERSION, int(backup_config["super_backup_channel_id"])
+            int(backup_config["super_backup_channel_id"])
         )
     await state.clear()
     await callback.answer("Roziligingiz saqlandi.", show_alert=True)
@@ -5223,9 +5238,9 @@ async def super_backup_worker() -> None:
     while True:
         try:
             await db.requeue_stale_super_backups()
-            pending = await db.pending_super_backups(TERMS_VERSION)
+            pending = await db.pending_super_backups()
             for candidate in pending:
-                row = await db.claim_super_backup(candidate["id"], TERMS_VERSION)
+                row = await db.claim_super_backup(candidate["id"])
                 if not row:
                     continue
                 try:
@@ -5241,6 +5256,16 @@ async def super_backup_worker() -> None:
             await asyncio.sleep(idle_delay)
         except asyncio.CancelledError:
             return
+        except asyncpg.DeadlockDetectedError:
+            # Render eski va yangi instance'ni qisqa vaqt birga ishlatishi
+            # mumkin. Sxema migratsiyasi paytidagi vaqtinchalik deadlockda
+            # navbat yo'qolmaydi; ishchi shovqinsiz qayta urinadi.
+            retry_delay = 3 + secrets.randbelow(5)
+            log.warning(
+                "Super backup database lock detected during deploy; retrying in %ss",
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
         except Exception:
             log.exception("Super backup worker iteration failed")
             await asyncio.sleep(3)
@@ -5282,7 +5307,7 @@ async def flush_pending_super_backup(
         if latest["status"] == "failed":
             return False
         if latest["status"] == "pending":
-            row = await db.claim_super_backup(latest["id"], TERMS_VERSION)
+            row = await db.claim_super_backup(latest["id"])
             if row:
                 try:
                     await process_super_backup_asset(row)
@@ -5513,7 +5538,7 @@ async def security_headers(request: Request, call_next: Any) -> Response:
     return response
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def root() -> str:
     return "<h1>KeepGram</h1><p>Telegram personal vault bot is running.</p>"
 
@@ -5560,6 +5585,7 @@ async def telegram_webhook(request: Request) -> Response:
     return Response(status_code=200)
 
 
+@app.get("/favicon.ico", include_in_schema=False)
 @app.get("/assets/logo.png", include_in_schema=False)
 async def logo() -> FileResponse:
     path = BASE_DIR / "assets" / "logo.png"
@@ -5568,7 +5594,12 @@ async def logo() -> FileResponse:
     return FileResponse(path, media_type="image/png")
 
 
-@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+@app.api_route(
+    "/admin",
+    methods=["GET", "HEAD"],
+    response_class=HTMLResponse,
+    include_in_schema=False,
+)
 async def admin_page() -> FileResponse:
     return FileResponse(BASE_DIR / "admin.html", media_type="text/html")
 
@@ -5874,9 +5905,7 @@ async def admin_backup_settings(_: str = Depends(session_admin)) -> dict[str, An
     config = await db.super_backup_config()
     consented_users = await db.ready().fetchval(
         """SELECT count(*) FROM users
-           WHERE onboarding_completed AND terms_accepted_at IS NOT NULL
-             AND terms_version=$1""",
-        TERMS_VERSION,
+           WHERE onboarding_completed AND terms_accepted_at IS NOT NULL""",
     )
     channel_title: str | None = None
     if config["super_backup_channel_id"]:
@@ -5933,9 +5962,7 @@ async def admin_update_backup_settings(
     row = await db.set_super_backup_config(body.enabled, channel_id)
     queued = 0
     if body.enabled and channel_id:
-        queued = await db.enqueue_existing_consented_backups(
-            TERMS_VERSION, channel_id
-        )
+        queued = await db.enqueue_existing_consented_backups(channel_id)
     await admin_log(
         admin,
         "update_super_backup",

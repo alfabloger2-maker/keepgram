@@ -137,7 +137,7 @@ Admin paneldagi foydalanuvchilar, kanallar, fayllar, backup va audit sahifalari 
 
 Birinchi `/start` da foydalanuvchi `🇺🇿 O‘zbekcha`, `🇬🇧 English` yoki `🇷🇺 Русский` tilini tanlaydi. Tanlov `users.preferred_language` maydonida saqlanadi va menyu, inline tugmalar, ogohlantirishlar, fayl kartalari, qidiruv, savat, eslatma hamda Telegram command tavsiflariga qo‘llanadi. Tilni `⚙️ Sozlamalar → 🌐 Til / Language` orqali istalgan payt almashtirish mumkin.
 
-Foydalanish shartlari 2.0 versiyada soddalashtirilgan va uch tilda alohida yozilgan. Unda hisob ma’lumotlari, shaxsiy storage kanal, administrator boshqaradigan avariya backupi, o‘chirish/tiklash va xavfsizlik aniq tushuntiriladi. Versiya o‘zgargani uchun avvalgi foydalanuvchilardan yangi matnga qayta rozilik olinadi.
+Foydalanish shartlari 2.0 versiyada soddalashtirilgan va uch tilda alohida yozilgan. Unda hisob ma’lumotlari, shaxsiy storage kanal, administrator boshqaradigan avariya backupi, o‘chirish/tiklash va xavfsizlik aniq tushuntiriladi. Rozilik har bir foydalanuvchidan faqat bir marta olinadi; qabul qilingan matn versiyasi audit uchun bazada saqlanadi.
 
 ## Rozilikka asoslangan umumiy backup kanalini yoqish
 

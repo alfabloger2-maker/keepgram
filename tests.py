@@ -124,13 +124,13 @@ class KeepGramCoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             main.verify_manifest_bytes(raw, 456)
 
-    def test_terms_acceptance_requires_current_version(self):
+    def test_terms_acceptance_is_one_time(self):
         self.assertTrue(
             main.terms_are_current(
                 {"terms_accepted_at": "2026-09-01T00:00:00Z", "terms_version": main.TERMS_VERSION}
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             main.terms_are_current(
                 {"terms_accepted_at": "2026-09-01T00:00:00Z", "terms_version": "old"}
             )
@@ -138,6 +138,17 @@ class KeepGramCoreTests(unittest.TestCase):
         self.assertFalse(
             main.terms_are_current({"terms_accepted_at": None, "terms_version": None})
         )
+
+    def test_trash_retention_uses_typed_interval(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        self.assertIn("make_interval(days => $1::int)", source)
+        self.assertNotIn("($1::text||' days')::interval", source)
+
+    def test_direct_code_handler_precedes_text_save_handler(self):
+        source = Path("main.py").read_text(encoding="utf-8")
+        direct = source.index("async def get_file_immediately_by_code")
+        save_state = source.index("async def save_text_state")
+        self.assertLess(direct, save_state)
 
     def test_schema_contains_mandatory_onboarding_fields(self):
         schema = Path("schema.sql").read_text(encoding="utf-8")
