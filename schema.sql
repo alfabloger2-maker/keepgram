@@ -13,6 +13,7 @@ create table if not exists users (
   display_name text,
   phone text,
   language_code text,
+  preferred_language varchar(2) check (preferred_language in ('uz','en','ru')),
   onboarding_completed boolean not null default false,
   onboarded_at timestamptz,
   terms_accepted_at timestamptz,
@@ -28,6 +29,7 @@ alter table users add column if not exists onboarding_completed boolean not null
 alter table users add column if not exists onboarded_at timestamptz;
 alter table users add column if not exists terms_accepted_at timestamptz;
 alter table users add column if not exists terms_version varchar(16);
+alter table users add column if not exists preferred_language varchar(2);
 
 create table if not exists storage_channels (
   id uuid primary key default gen_random_uuid(),
@@ -58,6 +60,7 @@ create table if not exists user_settings (
 );
 
 alter table user_settings add column if not exists auto_manifest_enabled boolean not null default true;
+alter table user_settings add column if not exists compact_cards boolean not null default true;
 
 create table if not exists catalogs (
   id uuid primary key default gen_random_uuid(),
@@ -193,6 +196,70 @@ create table if not exists backup_assets (
   unique(file_id, version)
 );
 
+-- Fast counters avoid SUM/COUNT scans on every upload. A reconciliation query at
+-- startup keeps them correct even after manual SQL maintenance.
+create table if not exists user_counters (
+  user_id uuid primary key references users(id) on delete cascade,
+  record_count integer not null default 0,
+  item_count bigint not null default 0,
+  total_size bigint not null default 0,
+  trash_count integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists processed_updates (
+  update_id bigint primary key,
+  status varchar(16) not null default 'processing'
+    check (status in ('processing','done','failed')),
+  attempts integer not null default 1,
+  claimed_at timestamptz not null default now(),
+  completed_at timestamptz,
+  error_message text
+);
+
+create table if not exists saved_views (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references users(id) on delete cascade,
+  name varchar(32) not null,
+  query text not null check (char_length(query) between 1 and 120),
+  created_at timestamptz not null default now(),
+  unique(user_id,name)
+);
+
+create table if not exists reminders (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references users(id) on delete cascade,
+  file_id uuid references files(id) on delete cascade,
+  remind_at timestamptz not null,
+  note varchar(200),
+  status varchar(16) not null default 'pending'
+    check (status in ('pending','processing','sent','failed','cancelled')),
+  attempts integer not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists share_tokens (
+  id uuid primary key default gen_random_uuid(),
+  file_id uuid not null references files(id) on delete cascade,
+  owner_user_id uuid not null references users(id) on delete cascade,
+  token varchar(48) unique not null,
+  expires_at timestamptz not null,
+  max_uses integer not null default 1 check (max_uses between 1 and 100),
+  use_count integer not null default 0,
+  revoked_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists job_failures (
+  id bigserial primary key,
+  worker varchar(32) not null,
+  target_id text,
+  error_type varchar(100),
+  error_message text,
+  created_at timestamptz not null default now()
+);
+
 alter table backup_assets add column if not exists owner_name text;
 alter table backup_assets add column if not exists owner_username text;
 alter table backup_assets add column if not exists source_channel_title text;
@@ -206,6 +273,13 @@ create index if not exists files_user_catalog_idx on files(user_id, catalog);
 create index if not exists files_tags_gin_idx on files using gin(tags);
 create index if not exists files_kinds_gin_idx on files using gin(file_kinds);
 create index if not exists files_title_trgm_idx on files using gin(lower(title) gin_trgm_ops);
+create index if not exists files_code_global_idx on files(code);
+create index if not exists users_username_trgm_idx on users using gin(lower(coalesce(username,'')) gin_trgm_ops);
+create index if not exists users_display_name_trgm_idx on users using gin(lower(coalesce(display_name,'')) gin_trgm_ops);
+create index if not exists users_phone_trgm_idx on users using gin(coalesce(phone,'') gin_trgm_ops);
+create index if not exists channels_title_trgm_idx on storage_channels using gin(lower(coalesce(channel_title,'')) gin_trgm_ops);
+create index if not exists backups_title_trgm_idx on backup_assets using gin(lower(title) gin_trgm_ops);
+create index if not exists audit_action_trgm_idx on audit_logs using gin(lower(action) gin_trgm_ops);
 create index if not exists file_parts_file_position_idx on file_parts(file_id, position);
 create index if not exists file_parts_unique_id_idx
   on file_parts(telegram_file_unique_id) where telegram_file_unique_id is not null;
@@ -214,6 +288,24 @@ create index if not exists audit_logs_created_idx on audit_logs(created_at desc)
 create index if not exists backup_assets_status_created_idx on backup_assets(status, created_at);
 create index if not exists backup_assets_owner_idx on backup_assets(owner_telegram_id, created_at desc);
 create index if not exists link_tokens_expiry_idx on channel_link_tokens(expires_at);
+create index if not exists files_trash_idx on files(user_id,deleted_at desc) where deleted_at is not null;
+create index if not exists processed_updates_claim_idx on processed_updates(status,claimed_at);
+create index if not exists reminders_due_idx on reminders(status,remind_at) where status='pending';
+create index if not exists share_tokens_token_idx on share_tokens(token) where revoked_at is null;
+create index if not exists saved_views_user_idx on saved_views(user_id,created_at desc);
+create index if not exists job_failures_created_idx on job_failures(created_at desc);
+
+insert into user_counters(user_id,record_count,item_count,total_size,trash_count)
+select u.id,
+       count(f.id) filter(where f.deleted_at is null)::int,
+       coalesce(sum(f.item_count) filter(where f.deleted_at is null),0)::bigint,
+       coalesce(sum(f.file_size) filter(where f.deleted_at is null),0)::bigint,
+       count(f.id) filter(where f.deleted_at is not null)::int
+from users u left join files f on f.user_id=u.id
+group by u.id
+on conflict(user_id) do update set
+  record_count=excluded.record_count,item_count=excluded.item_count,
+  total_size=excluded.total_size,trash_count=excluded.trash_count,updated_at=now();
 
 create or replace function set_updated_at() returns trigger language plpgsql as $$
 begin
@@ -241,7 +333,15 @@ alter table channel_link_tokens enable row level security;
 alter table audit_logs enable row level security;
 alter table app_settings enable row level security;
 alter table backup_assets enable row level security;
+alter table user_counters enable row level security;
+alter table processed_updates enable row level security;
+alter table saved_views enable row level security;
+alter table reminders enable row level security;
+alter table share_tokens enable row level security;
+alter table job_failures enable row level security;
 
 revoke all on table users, storage_channels, user_settings, catalogs, files, file_parts,
   channel_link_tokens, audit_logs from anon, authenticated;
 revoke all on table app_settings, backup_assets from anon, authenticated;
+revoke all on table user_counters, processed_updates, saved_views, reminders,
+  share_tokens, job_failures from anon, authenticated;

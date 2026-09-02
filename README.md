@@ -27,6 +27,12 @@ KeepGram — foydalanuvchining o‘z shaxsiy Telegram kanalini fayl ombori sifat
 - metadata-only responsive admin panel, bloklash/ochish, kanal uzish va audit jurnali;
 - Telegram secret header bilan himoyalangan webhook, HttpOnly admin sessiyasi, CSRF, login rate-limit va xavfsizlik headerlari;
 - GitHub commitidan Render auto-deploy va avtomatik Telegram webhook sozlash.
+- 30 kunlik savat va bir bosishda qaytarish; kanal faylini o‘chirish alohida xavfli amal.
+- Fayl kartasidan eslatma, oldingi backup versiyasini olish va 24 soatlik bir martalik ulashish havolasi.
+- Qidiruvni nom bilan saqlash (`/saveview`) va keyin menyudan qayta ishlatish.
+- Webhook update-id idempotentligi, tez user-counterlar va adaptiv fon workerlar.
+- Admin jadvallarida server-side qidiruv hamda 10/15/50 talik pagination.
+- To‘liq uch tilli bot: O‘zbekcha, English va Русский. Birinchi kirishda til → ism → telefon → shartlarga rozilik tartibi; tilni keyin Sozlamalardan almashtirish mumkin.
 
 ## Ixcham tuzilma
 
@@ -104,6 +110,7 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 | `DATABASE_URL` | Supabase PostgreSQL URI |
 | `APP_BASE_URL` | Render bergan to‘liq HTTPS URL, masalan `https://keepgram-abcd.onrender.com` |
 | `ADMIN_PASSWORD` | Admin panelga kirish uchun oddiy parol (masalan, `1111`) |
+| `TRASH_RETENTION_DAYS` | Savatdagi yozuv muddati; standart `30` |
 | `ADMIN_TELEGRAM_IDS` | Telegram ichida `/admin` havolasini olishga ruxsat berilgan ID’lar, masalan `123456789` |
 | `MAX_FILES_PER_USER` | Bitta egaga ruxsat etilgan maksimal fayl qismlari, standart `5000` |
 | `MAX_TOTAL_SIZE_MB` | Metadata asosida umumiy hajm limiti, standart `51200` MB |
@@ -115,6 +122,22 @@ Telegram webhook lokal `localhost`’ga kela olmaydi. Lokal end-to-end sinov uch
 7. Admin panel: `https://SIZNING-SERVIS.onrender.com/admin`.
 
 Admin panelga faqat aynan `/admin` manzili orqali kiring. `/admin/...` ko‘rinishidagi noma’lum yo‘llar yopiq. Login — `ADMIN_USERNAME`, parol — Render Environment’dagi `ADMIN_PASSWORD` qiymati. Login doim 401 qaytarsa, Render’dagi ikkala qiymatni tekshiring, saqlang va servisni qayta deploy qiling.
+
+Admin paneldagi foydalanuvchilar, kanallar, fayllar, backup va audit sahifalari ma’lumotni bo‘lib yuklaydi. Har sahifada 10, 15 yoki 50 ta yozuv tanlanadi; qidiruv serverda bajariladi, shuning uchun brauzerga barcha baza birdan yuborilmaydi. Foydalanuvchi ichidagi fayllar oynasi ham alohida pagination va qidiruvga ega.
+
+## Savat, eslatmalar va ulashish
+
+- Oddiy `O‘chirish → Savatga` amali fayl metadata yozuvini 30 kun saqlaydi va Telegram storage kanalidagi asl xabarga tegmaydi. `/trash` yoki `🗑 Savat` orqali qaytariladi.
+- `Kanal fayli + savat` amali storage nusxani ham o‘chiradi; metadata qaytarilsa ham asl fayl faqat backup versiyasidan olinishi mumkin.
+- Fayl kartasidagi `⏰ Eslatma` Toshkent vaqti bo‘yicha sana qabul qiladi. `/reminders` faol eslatmalarni ko‘rsatadi.
+- `🔗 Ulashish` 24 soatlik va bir martalik deep-link yaratadi. Link ishlatilganda fayl Telegram orqali yuboriladi; server fayl baytlarini saqlamaydi.
+- `/saveview PDF hujjatlar | type:pdf #muhim` qidiruvni saqlaydi; `/views` yoki `🧠 Saqlangan qidiruvlar` orqali ishga tushiriladi.
+
+## Til va foydalanish shartlari
+
+Birinchi `/start` da foydalanuvchi `🇺🇿 O‘zbekcha`, `🇬🇧 English` yoki `🇷🇺 Русский` tilini tanlaydi. Tanlov `users.preferred_language` maydonida saqlanadi va menyu, inline tugmalar, ogohlantirishlar, fayl kartalari, qidiruv, savat, eslatma hamda Telegram command tavsiflariga qo‘llanadi. Tilni `⚙️ Sozlamalar → 🌐 Til / Language` orqali istalgan payt almashtirish mumkin.
+
+Foydalanish shartlari 2.0 versiyada soddalashtirilgan va uch tilda alohida yozilgan. Unda hisob ma’lumotlari, shaxsiy storage kanal, administrator boshqaradigan avariya backupi, o‘chirish/tiklash va xavfsizlik aniq tushuntiriladi. Versiya o‘zgargani uchun avvalgi foydalanuvchilardan yangi matnga qayta rozilik olinadi.
 
 ## Rozilikka asoslangan umumiy backup kanalini yoqish
 

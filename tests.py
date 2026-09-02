@@ -150,6 +150,47 @@ class KeepGramCoreTests(unittest.TestCase):
         self.assertIn("manifest_message_id bigint", schema)
         self.assertIn("terms_accepted_at timestamptz", schema)
         self.assertIn("terms_version varchar(16)", schema)
+        self.assertIn("preferred_language varchar(2)", schema)
+        self.assertIn("create table if not exists processed_updates", schema)
+        self.assertIn("create table if not exists user_counters", schema)
+        self.assertIn("create table if not exists saved_views", schema)
+        self.assertIn("create table if not exists reminders", schema)
+        self.assertIn("create table if not exists share_tokens", schema)
+        self.assertIn("files_trash_idx", schema)
+
+    def test_file_card_supports_compact_and_detailed_modes(self):
+        base = {
+            "id": uuid4(), "title": "Passport.pdf", "file_type": "pdf",
+            "file_kinds": ["pdf"], "tags": ["muhim"], "code": "ABC234",
+            "catalog": "Hujjat", "item_count": 1, "file_size": 2048,
+            "created_at": main.utcnow(),
+        }
+        compact = main.file_card({**base, "compact_cards": True})
+        detailed = main.file_card({**base, "compact_cards": False})
+        self.assertLess(len(compact), len(detailed))
+        self.assertIn("2.0 KB", compact)
+        self.assertIn("Hajm", detailed)
+
+    def test_admin_uses_server_pagination_sizes(self):
+        html = Path("admin.html").read_text(encoding="utf-8")
+        self.assertIn("[10,15,50]", html)
+        self.assertIn("/api/admin/users/${userFileId}/files", html)
+        self.assertIn("channelSearch", html)
+
+    def test_three_language_localization(self):
+        self.assertEqual(main.localize_text("📥 Saqlash", "en"), "📥 Save")
+        self.assertEqual(main.localize_text("📥 Saqlash", "ru"), "📥 Сохранить")
+        self.assertIn("📥 Save", main.menu_variants("📥 Saqlash"))
+        self.assertIn("📥 Сохранить", main.menu_variants("📥 Saqlash"))
+        self.assertIn("KeepGram Terms of Use", main.terms_text("en"))
+        self.assertIn("Условия использования KeepGram", main.terms_text("ru"))
+        self.assertIn("KeepGram foydalanish shartlari", main.terms_text("uz"))
+
+    def test_all_main_menu_buttons_have_three_variants(self):
+        for row in main.MAIN_MENU.keyboard:
+            for button in row:
+                variants = main.menu_variants(button.text)
+                self.assertGreaterEqual(len(variants), 3, button.text)
 
 
 if __name__ == "__main__":
